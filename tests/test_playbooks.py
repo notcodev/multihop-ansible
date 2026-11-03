@@ -1,6 +1,7 @@
 """Playbooks: syntax-check every entry point and exercise the uplink key rotation."""
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -546,3 +547,42 @@ def test_restore_paths_hand_the_backup_xray_state_to_entry_xray(path):
     assert "entry_app" in names[:pos]
     assert task["when"] == "entry_xray_enabled | bool"
     assert "entry_restore_xray_dir" in task["vars"]["entry_xray_restore_dir"]
+
+
+def _role_text(role):
+    """Tasks and templates of a role (what references variables at run time)."""
+    base = ROOT / "roles" / role
+    return "".join(p.read_text() for sub in ("tasks", "templates") if (base / sub).is_dir()
+                   for p in sorted((base / sub).rglob("*")) if p.is_file())
+
+
+def _role_defaults(role):
+    path = ROOT / "roles" / role / "defaults" / "main.yml"
+    return set((yaml.safe_load(path.read_text()) or {}) if path.exists() else {})
+
+
+def test_included_roles_whose_defaults_later_roles_use_are_public():
+    # include_role keeps a role's defaults to itself unless `public: true`; a
+    # later role reading them (entry_xray reads entry_app_network) then fails
+    # at run time with an undefined variable. import_role is always public.
+    problems = []
+    for path in sorted((ROOT / "playbooks").glob("*.yml")):
+        for play in yaml.safe_load(path.read_text()):
+            if "import_playbook" in play:
+                continue
+            included = []
+            for _, t in _flat_tasks([play]):
+                inc = t.get("ansible.builtin.include_role") or t.get("include_role")
+                if not inc:
+                    continue
+                role = inc["name"]
+                own = _role_defaults(role)
+                text = _role_text(role)
+                for earlier, public in included:
+                    used = {v for v in _role_defaults(earlier) - own
+                            if re.search(rf"\b{re.escape(v)}\b", text)}
+                    if used and not public:
+                        problems.append(f"{path.name}: {earlier} must be public for {role} "
+                                        f"({', '.join(sorted(used))})")
+                included.append((role, bool(inc.get("public"))))
+    assert not problems, problems

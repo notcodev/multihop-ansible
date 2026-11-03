@@ -277,3 +277,42 @@ archive_members() { tail -n +2 "$UPLOADS/$(uploaded_objects)" | tar -tf - | sed 
   expected="$($tar_cmd --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$ENTRY_DIR" -cf - . | shasum -a 256 | cut -d' ' -f1)"
   [ "$expected" = "$(cat "$MULTIHOP_STATE_DIR/backup/last.sha256")" ]
 }
+
+@test "an xray entry in the AWG dir is refused, with or without Xray" {
+  # It would land at ./xray/ and make every backup unrestorable.
+  mkdir "$ENTRY_DIR/xray"
+  run_script multihop-backup
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"$ENTRY_DIR/xray exists"* ]]
+  [ -z "$(uploaded_objects)" ]
+
+  with_xray
+  run_script multihop-backup
+  [ "$status" -eq 1 ]
+  [ -z "$(uploaded_objects)" ]
+
+  rmdir "$ENTRY_DIR/xray"
+  ln -s /tmp "$ENTRY_DIR/xray"
+  run_script multihop-backup
+  [ "$status" -eq 1 ]
+}
+
+@test "a symlink swapped in before the copy is not followed" {
+  with_xray
+  echo "TOP-SECRET" > "$BATS_TEST_TMPDIR/secret"
+  real_cp="$(command -v cp)"
+  # The race: xray_private.key becomes a symlink between the test and the copy.
+  cat > "$BATS_TEST_TMPDIR/bin/cp" <<STUB
+#!/bin/sh
+case "\$*" in *"$XRAY_DIR/xray_private.key"*)
+  rm -f "$XRAY_DIR/xray_private.key"; ln -s "$BATS_TEST_TMPDIR/secret" "$XRAY_DIR/xray_private.key" ;;
+esac
+exec "$real_cp" "\$@"
+STUB
+  chmod +x "$BATS_TEST_TMPDIR/bin/cp"
+  run_script multihop-backup
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"xray_private.key is not a regular file, left out"* ]]
+  ! archive_members | grep -q xray_private.key || false
+  ! tail -n +2 "$UPLOADS/$(uploaded_objects)" | grep -aq TOP-SECRET || false
+}

@@ -295,3 +295,50 @@ def test_old_backup_without_xray_still_valid(tmp_path):
     # Archives made before Task 9 have only the AWG files at the root.
     assert _xray_problems(tmp_path) == []
     assert backup.backup_archive_problems(_tar(tmp_path / "old.tar"), PORT, SUBNET) == []
+
+
+# --- fix round 1 ---------------------------------------------------------------
+
+def _dup(server, anchor, dup):
+    """Insert `dup` (a raw `"key": value` fragment) right after the `anchor` text."""
+    assert anchor in server
+    return server.replace(anchor, anchor + dup, 1)
+
+
+@pytest.mark.parametrize("server", [
+    # Go's encoding/json merges a duplicate object into the already-filled field:
+    # json.loads would keep only the last one and miss the access log.
+    _dup(SERVER_JSON, "{\n", '"log": {"loglevel": "info", "access": "/etc/cron.d/x"},\n'),
+    _dup(SERVER_JSON, '"port": 443,\n',
+         '"streamSettings": {"security": "reality", "sockopt": {"mark": 1}, "realitySettings": {}},\n'),
+    _dup(SERVER_JSON, '"streamSettings": {\n', '"realitySettings": {"dest": "/run/x.sock"},\n'),
+    _dup(SERVER_JSON, '"flow": "xtls-rprx-vision",\n', '"flow": "none",\n'),
+])
+def test_xray_server_json_duplicate_keys_rejected(tmp_path, server):
+    json.loads(server)  # still valid for a last-key-wins parser
+    probs = _xray_problems(tmp_path, extra=_xray(server=server))
+    assert any("server.json" in p and "duplicate key" in p for p in probs), probs
+
+
+def test_xray_clients_table_duplicate_keys_rejected(tmp_path):
+    table = '[{"clientId": "a", "clientId": "b"}]\n'
+    probs = _xray_problems(tmp_path, extra=_xray(extra=[("./xray/clientsTable", "file", table)]))
+    assert any("xray/clientsTable" in p and "duplicate key" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("dest", [
+    "localhost:443", "LOCALHOST:443", "127.0.0.1:443", "127.1.2.3:443", "10.0.0.1:443",
+    "172.16.0.1:443", "172.31.255.255:443", "192.168.1.1:443", "169.254.169.254:443",
+    "100.64.0.1:443", "0.0.0.0:443", "[::1]:443", "::1:443", "8.8.8.8:443",
+])
+def test_xray_reality_dest_must_be_a_public_host_name(tmp_path, dest):
+    server = _server(lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(dest=dest))
+    probs = _xray_problems(tmp_path, extra=_xray(server=server))
+    assert any("dest" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("dest", ["www.googletagmanager.com:443", "dl.google.com:443",
+                                  "a-b.example.co.uk:443"])
+def test_xray_reality_dest_host_names_pass(tmp_path, dest):
+    server = _server(lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(dest=dest))
+    assert _xray_problems(tmp_path, extra=_xray(server=server)) == []

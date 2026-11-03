@@ -47,6 +47,48 @@ XRAY_REQUIRED = ("server.json", *sorted(XRAY_KEY_FILES))
 XRAY_LOGLEVELS = {"debug", "info", "warning", "error", "none"}
 
 
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _no_duplicates(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateKey(f"duplicate key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _strict_json(text):
+    """json.loads that refuses duplicate keys at any level. json.loads keeps
+    the last one, but Go's encoding/json (Xray) merges a duplicate object into
+    the one already read, so a shape check of the last one would be bypassed."""
+    return json.loads(text, object_pairs_hook=_no_duplicates)
+
+
+# REALITY forwards unauthenticated probes to dest: it must be a public site
+# name as the app writes it ("<site>:443"), never loopback, a private address
+# or any IP literal.
+_DEST = re.compile(r"(?=[A-Za-z0-9.-]*[A-Za-z])([A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+):443")
+
+
+def _dest_ok(dest):
+    if not isinstance(dest, str):
+        return False
+    m = _DEST.fullmatch(dest)
+    if not m:
+        return False
+    host = m.group(1).lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
 def _parts(name):
     """Path components relative to the archive root, [] for the root itself,
     None for an absolute name or one with '', '.' or '..' components."""
@@ -167,9 +209,9 @@ def _inbound_problems(inbound, port):
         problems += _keys_problems(reality, rw, ("dest", "privateKey", "serverNames", "shortIds"))
         if isinstance(reality, dict):
             # The app builds dest as "<site>:443"; no sockets, no other ports.
-            if "dest" in reality and not (isinstance(reality["dest"], str)
-                                          and re.fullmatch(r"[A-Za-z0-9.-]+:443", reality["dest"])):
-                problems.append(f"{rw}: dest must be '<site>:443'")
+            if "dest" in reality and not _dest_ok(reality["dest"]):
+                problems.append(f"{rw}: dest must be '<public site name>:443' "
+                                "(no IP literal, localhost or private address)")
             if "privateKey" in reality and not (isinstance(reality["privateKey"], str)
                                                 and re.fullmatch(r"[A-Za-z0-9_=+/-]+", reality["privateKey"])):
                 problems.append(f"{rw}: privateKey must be a key string")
@@ -188,7 +230,9 @@ def xray_server_json_problems(text, port):
     the file is not restored).
     """
     try:
-        cfg = json.loads(text)
+        cfg = _strict_json(text)
+    except _DuplicateKey as exc:
+        return [f"xray/server.json has a {exc} (refused: Xray would merge it)"]
     except ValueError as exc:
         return [f"xray/server.json is not valid JSON ({exc})"]
     w = "xray/server.json"
@@ -222,7 +266,9 @@ def _xray_file_problems(name, data, xray_port):
         return xray_server_json_problems(text, xray_port)
     if name == "clientsTable":
         try:
-            json.loads(text)
+            _strict_json(text)
+        except _DuplicateKey as exc:
+            return [f"xray/clientsTable has a {exc}"]
         except ValueError as exc:
             return [f"xray/clientsTable is not valid JSON ({exc})"]
         return []

@@ -90,15 +90,24 @@ stage="$(mktemp -d "$bdir/stage.XXXXXX")"
 trap 'rm -rf "$tmp" "$stage"' EXIT
 root="$stage/root"
 cp -a "$ENTRY_STATE_DIR" "$root"
+# ./xray/ is reserved for the Xray state, with or without Xray: a stray entry
+# there would make every backup unrestorable (the restore refuses it).
+if [ -e "$root/xray" ] || [ -L "$root/xray" ]; then
+  echo "ERROR: $ENTRY_STATE_DIR/xray exists; it would clash with the Xray state in the archive" >&2
+  exit 1
+fi
 if [ -n "$XRAY_STATE_DIR" ] && [ -f "$XRAY_STATE_DIR/server.json" ] && [ ! -L "$XRAY_STATE_DIR/server.json" ]; then
-  if [ -e "$root/xray" ] || [ -L "$root/xray" ]; then
-    echo "ERROR: $ENTRY_STATE_DIR/xray exists; it would clash with the Xray state in the archive" >&2
-    exit 1
-  fi
   mkdir -m 0700 "$root/xray"
   for f in $XRAY_FILES; do
     src="$XRAY_STATE_DIR/$f"
-    if [ -f "$src" ] && [ ! -L "$src" ]; then cp -p "$src" "$root/xray/$f"; fi
+    dst="$root/xray/$f"
+    # -P: a symlink swapped in after the test is copied as a link, never
+    # followed; the re-check then drops it (the restore would refuse it).
+    if [ -f "$src" ] && [ ! -L "$src" ]; then cp -P -p "$src" "$dst"; fi
+    if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then
+      echo "WARNING: $src is not a regular file, left out" >&2
+      rm -f "$dst"
+    fi
   done
   touch -r "$XRAY_STATE_DIR" "$root/xray"
   touch -r "$ENTRY_STATE_DIR" "$root"

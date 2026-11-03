@@ -41,9 +41,11 @@
         - name: Fetch, decrypt and validate the backup on the controller
           ansible.builtin.include_tasks: tasks/fetch-backup.yml
 
+        # public: entry_xray below reads entry_app's defaults (entry_app_network).
         - name: Apply entry_app with the backup
           ansible.builtin.include_role:
             name: entry_app
+            public: true
 
         # A backup without xray/ leaves the Xray state as it is (or seeds it);
         # fetch-backup.yml printed a notice.
