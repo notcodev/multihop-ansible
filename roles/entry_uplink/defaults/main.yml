@@ -6,3 +6,9 @@ entry_uplink_state_dir: /var/lib/multihop/uplink
 entry_uplink_bridges:
   - docker0
   - amn0
+# Loopback port of the entry Xray's TPROXY inbound (reality mode).
+uplink_tproxy_port: 12345  # noqa: var-naming[no-role-prefix]
+# The app's Xray server on the entry; when enabled, replies of connections to
+# entry_xray_port leave via the entry IP (multihop-entry-net).
+entry_xray_enabled: false  # noqa: var-naming[no-role-prefix]
+entry_xray_port: 443  # noqa: var-naming[no-role-prefix]

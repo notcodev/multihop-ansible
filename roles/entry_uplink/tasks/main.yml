@@ -1,4 +1,25 @@
 ---
+# The bridges' subnets, which multihop-entry-net keeps out of TPROXY in
+# reality mode. entry_app creates the app network after this role on a first
+# deploy, so until then its configured subnet stands in.
+- name: Read the bridges' docker networks
+  community.docker.docker_network_info:
+    name: "{{ item }}"
+  loop:
+    - bridge
+    - "{{ entry_app_network }}"
+  register: entry_uplink_networks
+
+- name: Collect the bridges' IPv4 subnets
+  ansible.builtin.set_fact:
+    entry_uplink_local_nets: >-
+      {{ (entry_uplink_networks.results
+          | selectattr('exists')
+          | map(attribute='network.IPAM.Config', default=[]) | reject('none') | flatten
+          | map(attribute='Subnet') | reject('search', ':') | list
+         + ([] if (entry_uplink_networks.results[1].exists) else [entry_app_network_subnet]))
+         | unique }}
+
 # Own marker so the common block in multihop.env survives re-runs.
 - name: Write uplink keys to multihop.env
   ansible.builtin.blockinfile:
@@ -14,6 +35,10 @@
       EXIT_DOMAIN={{ exit_domain }}
       EXIT_PORT={{ exit_awg_port }}
       EXIT_PUBKEY={{ vault_link_awg.exit_public_key }}
+      UPLINK_TRANSPORT={{ uplink_transport }}
+      UPLINK_TPROXY_PORT={{ uplink_tproxy_port }}
+      ENTRY_LOCAL_NETS="{{ entry_uplink_local_nets | join(' ') }}"
+      ENTRY_XRAY_PORT={{ entry_xray_port if entry_xray_enabled | bool else '' }}
   notify: Reload multihop-net
 
 - name: Install multihop scripts

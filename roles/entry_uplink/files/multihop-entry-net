@@ -28,10 +28,36 @@
 # The reply mark has its own byte (mask 0xff00), disjoint from the direct
 # mark's (0xff).
 #
+# The entry Xray server (ENTRY_XRAY_PORT, empty = off) gets the same
+# exception in both modes, keyed on conntrack, never on a source port: only
+# the REPLY direction of a connection DNAT'ed to ENTRY_XRAY_PORT is
+# reply-marked and let out the public interface by MULTIHOP-FWD.
+#
+# UPLINK_TRANSPORT selects the uplink. `awg` (default): as above. `reality`
+# (spec: docs/superpowers/specs/2026-11-03-xray-only-uplink-addendum.md, 3):
+# table 51820 also holds `local default dev lo`, and MULTIHOP-MARK sends
+# everything not reply- or direct-marked (force_exit first) to
+# MULTIHOP-TPROXY, which RETURNs local and ENTRY_LOCAL_NETS destinations,
+# hands TCP and UDP to the local Xray (TPROXY to 127.0.0.1:UPLINK_TPROXY_PORT)
+# and drops the rest. A packet from a bridge then goes exactly one way:
+#   reply-marked  -> 10110 -> main -> public iface (FWD allows only AWG UDP
+#                    and the Xray REPLY match)
+#   direct-marked -> 10100 -> main -> public iface (FWD direct-mark rule)
+#   local/bridge  -> 10120 -> main -> local or bridge
+#   other tcp/udp -> TPROXY socket; 10130 -> 51820 -> `local` -> delivered to
+#                    Xray, whose only outbound is the exit. Xray not
+#                    listening: TPROXY drops. TPROXY rule missing: local
+#                    delivery to no socket (RST/unreachable). `local` route
+#                    missing: blackhole. Never forwarded.
+#   other protocols -> DROP in MULTIHOP-TPROXY
+# and the FWD backstop drops anything else that tries to leave a bridge.
+#
 # Ordering inside `up` is part of the guarantee: the firewall backstop and the
 # blackhole route are in place before any ip rule is touched, every iptables
-# chain is rebuilt and swapped in atomically, and ip rules are swapped through
-# a staging priority so a bridge is never left without a rule into 51820.
+# chain is rebuilt and swapped in atomically (MULTIHOP-TPROXY is complete
+# before MULTIHOP-MARK references it and retired only after no MARK does),
+# and ip rules are swapped through a staging priority so a bridge is never
+# left without a rule into 51820. A bad env fails `up` before any change.
 # Runs before Docker at boot, so it must not depend on Docker's chains.
 set -euo pipefail
 
@@ -42,6 +68,10 @@ MULTIHOP_ENV="${MULTIHOP_ENV:-/etc/multihop/multihop.env}"
 : "${PUBLIC_IFACE:?PUBLIC_IFACE not set in $MULTIHOP_ENV}"
 : "${ENTRY_AWG_PORT:?ENTRY_AWG_PORT not set in $MULTIHOP_ENV}"
 : "${BRIDGES:?BRIDGES not set in $MULTIHOP_ENV}"
+UPLINK_TRANSPORT="${UPLINK_TRANSPORT:-awg}"
+UPLINK_TPROXY_PORT="${UPLINK_TPROXY_PORT:-12345}"
+ENTRY_XRAY_PORT="${ENTRY_XRAY_PORT:-}"
+ENTRY_LOCAL_NETS="${ENTRY_LOCAL_NETS:-}"
 RT_TABLES_DIR="${MULTIHOP_RT_TABLES_DIR:-/etc/iproute2/rt_tables.d}"
 
 UPLINK_IFACE=awg-uplink
@@ -54,6 +84,25 @@ DIRECT_SET=multihop_direct
 FORCE_EXIT_SET=multihop_force_exit
 RULE_PREFS="10100 10110 10120 10130"
 PUBLIC_GROUP=51820
+# conntrack match for the REPLY direction of connections DNAT'ed to the entry
+# Xray's published port (prefixed with -p tcp / -p udp)
+XRAY_REPLY="-m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport $ENTRY_XRAY_PORT"
+TPROXY_CHAIN=MULTIHOP-TPROXY
+LOCAL_ROUTE="local default dev lo table $TABLE"
+
+die() { echo "${0##*/}: $*" >&2; exit 1; }
+
+# Refuse a bad env before anything changes (the live rules stay as they are).
+check_env() {
+  case "$UPLINK_TRANSPORT" in
+    awg) ;;
+    reality) [ -n "$ENTRY_LOCAL_NETS" ] \
+               || die "ENTRY_LOCAL_NETS is empty: reality mode would proxy bridge-to-bridge traffic" ;;
+    *) die "UPLINK_TRANSPORT must be awg or reality, not '$UPLINK_TRANSPORT'" ;;
+  esac
+  case "$UPLINK_TPROXY_PORT" in ''|*[!0-9]*) die "UPLINK_TPROXY_PORT is not a port: '$UPLINK_TPROXY_PORT'" ;; esac
+  case "$ENTRY_XRAY_PORT" in *[!0-9]*) die "ENTRY_XRAY_PORT is not a port: '$ENTRY_XRAY_PORT'" ;; esac
+}
 
 # drop_chain <table> <parent> <chain>: remove every jump from the parent to
 # the chain (whatever its match), then flush and delete the chain if present.
@@ -115,20 +164,92 @@ ip6_undrop() {
 }
 
 # Allow-list per bridge: into the uplink, between the bridges, and out the
-# public interface only direct-marked or AWG UDP. Everything else from a
-# bridge is dropped, whatever the output interface (e.g. a provider private
-# network on another NIC, which rule 10120 may route to via main).
+# public interface only direct-marked, AWG UDP or Xray server replies.
+# Everything else from a bridge is dropped, whatever the output interface
+# (e.g. a provider private network on another NIC, which rule 10120 may route
+# to via main).
 fwd_rules() {
-  local br out
+  local br out proto
   for br in $BRIDGES; do
     echo "-i $br -o $UPLINK_IFACE -j RETURN"
     for out in $BRIDGES; do echo "-i $br -o $out -j RETURN"; done
     echo "-i $br -o $PUBLIC_IFACE -m mark --mark $DIRECT_MARK -j RETURN"
     echo "-i $br -o $PUBLIC_IFACE $AWG_UDP -j RETURN"
+    if [ -n "$ENTRY_XRAY_PORT" ]; then
+      for proto in tcp udp; do
+        echo "-i $br -o $PUBLIC_IFACE -p $proto $XRAY_REPLY -j RETURN"
+      done
+    fi
   done
   for br in $BRIDGES; do
     echo "-i $br -j DROP"
   done
+}
+
+# mark_rules [tproxy-chain]: MULTIHOP-MARK. Without a chain (awg mode) the
+# three rules of the AWG uplink; with one (reality mode) the addendum 3.2
+# layout, ending in a jump to it. The reply marks come first in both, so a
+# reply to a force_exit address is still marked.
+mark_rules() {
+  local proto
+  echo "$AWG_UDP -j MARK --set-mark $REPLY_MARK"
+  if [ -n "$ENTRY_XRAY_PORT" ]; then
+    for proto in tcp udp; do
+      echo "-p $proto $XRAY_REPLY -j MARK --set-mark $REPLY_MARK"
+    done
+  fi
+  if [ -z "${1:-}" ]; then
+    echo "-m set --match-set $FORCE_EXIT_SET dst -j RETURN"
+    echo "-m set --match-set $DIRECT_SET dst -j MARK --set-mark $DIRECT_MARK"
+    return
+  fi
+  echo "-m mark --mark $REPLY_MARK -j RETURN"
+  echo "-m set --match-set $FORCE_EXIT_SET dst -j $1"
+  echo "-m set --match-set $DIRECT_SET dst -j MARK --set-mark $DIRECT_MARK"
+  echo "-m mark --mark $DIRECT_MARK -j RETURN"
+  echo "-j $1"
+}
+
+# MULTIHOP-TPROXY: local and bridge destinations go back to normal routing,
+# TCP and UDP to the local Xray, anything else is dropped.
+tproxy_rules() {
+  local net proto
+  echo "-m addrtype --dst-type LOCAL -j RETURN"
+  for net in $ENTRY_LOCAL_NETS; do echo "-d $net -j RETURN"; done
+  for proto in tcp udp; do
+    echo "-p $proto -j TPROXY --on-ip 127.0.0.1 --on-port $UPLINK_TPROXY_PORT"
+  done
+  echo "-j DROP"
+}
+
+# install_mark <jump-match...>: swap MULTIHOP-MARK in (install_chain) and,
+# in reality mode, MULTIHOP-TPROXY with it. The TPROXY chain is built
+# complete under a staging name, the new MARK references that name, then
+# the old TPROXY (referenced only by the old, now retired MARK) is dropped
+# and the staging chain renamed (references follow the rename). In awg mode
+# MARK without the jumps goes in first, then TPROXY is dropped.
+# A run interrupted between the MARK swap and the rename leaves MARK jumping
+# to the staging chain; the next run drops it first (bridge traffic then
+# meets the `local` route without TPROXY: fail-closed) and converges.
+install_mark() {
+  if [ "$UPLINK_TRANSPORT" = reality ]; then
+    local new="$TPROXY_CHAIN-NEW" rule
+    # a leftover staging MARK may reference the staging TPROXY
+    drop_chain mangle PREROUTING MULTIHOP-MARK-NEW
+    drop_chain mangle MULTIHOP-MARK "$new"
+    iptables -t mangle -N "$new"
+    while read -r rule; do
+      # shellcheck disable=SC2086 # word splitting of the rule is intended
+      iptables -t mangle -A "$new" $rule
+    done < <(tproxy_rules)
+    mark_rules "$new" | install_chain mangle PREROUTING MULTIHOP-MARK "$@"
+    drop_chain mangle MULTIHOP-MARK "$TPROXY_CHAIN"
+    iptables -t mangle -E "$new" "$TPROXY_CHAIN"
+  else
+    mark_rules | install_chain mangle PREROUTING MULTIHOP-MARK "$@"
+    drop_chain mangle MULTIHOP-MARK "$TPROXY_CHAIN-NEW"
+    drop_chain mangle MULTIHOP-MARK "$TPROXY_CHAIN"
+  fi
 }
 
 # rule_selectors <pref>: the ip rule selectors wanted at that priority.
@@ -173,6 +294,7 @@ install_rules() {
 }
 
 up() {
+  check_env
   if [ "$(cat "$RT_TABLES_DIR/$TABLE_NAME.conf" 2>/dev/null)" != "$TABLE $TABLE_NAME" ]; then
     mkdir -p "$RT_TABLES_DIR"
     echo "$TABLE $TABLE_NAME" > "$RT_TABLES_DIR/$TABLE_NAME.conf"
@@ -185,17 +307,14 @@ up() {
   ip6_drop
 
   # 2. Marking (one PREROUTING jump per bridge, so the chain only ever sees
-  #    bridge traffic), NAT and MSS clamp. The reply mark comes before the
-  #    force_exit RETURN so a reply to a force_exit address is still marked.
+  #    bridge traffic; in reality mode with MULTIHOP-TPROXY), NAT and MSS
+  #    clamp. The reply marks come before the force_exit rule so a reply to
+  #    a force_exit address is still marked.
   ipset create "$DIRECT_SET" hash:net -exist
   ipset create "$FORCE_EXIT_SET" hash:net -exist
   local br jumps=()
   for br in $BRIDGES; do jumps+=("-i $br"); done
-  install_chain mangle PREROUTING MULTIHOP-MARK "${jumps[@]}" <<RULES
-$AWG_UDP -j MARK --set-mark $REPLY_MARK
--m set --match-set $FORCE_EXIT_SET dst -j RETURN
--m set --match-set $DIRECT_SET dst -j MARK --set-mark $DIRECT_MARK
-RULES
+  install_mark "${jumps[@]}"
   install_chain nat POSTROUTING MULTIHOP-NAT <<RULES
 -o $UPLINK_IFACE -j MASQUERADE
 RULES
@@ -207,7 +326,17 @@ RULES
   #    fall through to main), the public interface's group before the rule
   #    that suppresses it, then the rules. A missing interface (not up yet)
   #    only loses the group: its routes then hit the FWD backstop (dropped).
+  #    Reality mode adds the `local` route (local delivery to the TPROXY
+  #    socket); awg mode removes it, leaving the uplink's route and the
+  #    blackhole.
   ip route replace blackhole default metric 4096 table "$TABLE"
+  if [ "$UPLINK_TRANSPORT" = reality ]; then
+    # shellcheck disable=SC2086
+    ip route replace $LOCAL_ROUTE
+  else
+    # shellcheck disable=SC2086
+    ip route del $LOCAL_ROUTE 2>/dev/null || true
+  fi
   ip link set dev "$PUBLIC_IFACE" group "$PUBLIC_GROUP" \
     || echo "${0##*/}: cannot set the group of $PUBLIC_IFACE; bridge traffic to its non-default routes is dropped" >&2
   install_rules
@@ -221,10 +350,14 @@ down() {
     del_pref "$p"
     del_pref $((p + 1))
   done
+  # shellcheck disable=SC2086
+  ip route del $LOCAL_ROUTE 2>/dev/null || true
   ip route del blackhole default metric 4096 table "$TABLE" 2>/dev/null || true
   ip link set dev "$PUBLIC_IFACE" group default 2>/dev/null || true
   local spec
-  for spec in "mangle PREROUTING MULTIHOP-MARK" "nat POSTROUTING MULTIHOP-NAT" \
+  # MULTIHOP-TPROXY after MULTIHOP-MARK, which references it
+  for spec in "mangle PREROUTING MULTIHOP-MARK" "mangle MULTIHOP-MARK $TPROXY_CHAIN" \
+              "nat POSTROUTING MULTIHOP-NAT" \
               "mangle FORWARD MULTIHOP-MSS" "filter DOCKER-USER MULTIHOP-FWD"; do
     # shellcheck disable=SC2086
     set -- $spec

@@ -35,9 +35,11 @@ case "$op" in
   -E) [ -f "$(f "$1")" ] || exit 1; mv "$(f "$1")" "$(f "$2")"
       for x in "$d/$t".*; do sed -E "s/(^| )-j $1\$/\1-j $2/" "$x" > "$x.t"; mv "$x.t" "$x"; done ;;
   -S) [ -f "$(f "$1")" ] || exit 1; echo "-N $1"; sed "s/^/-A $1 /" "$(f "$1")" ;;
-  -A) c="$1"; shift; [ -f "$(f "$c")" ] || exit 1; echo "$*" >> "$(f "$c")" ;;
-  -I) c="$1"; shift; [ -f "$(f "$c")" ] || exit 1
-      { echo "$*"; cat "$(f "$c")"; } > "$(f "$c").t"; mv "$(f "$c").t" "$(f "$c")" ;;
+  -A|-I) c="$1"; shift; [ -f "$(f "$c")" ] || exit 1
+      # like iptables, a jump to a user chain needs that chain to exist
+      r="$*"; case " $r " in *" -j MULTIHOP-"*) j="${r##*-j }"; [ -f "$(f "${j%% *}")" ] || exit 1 ;; esac
+      if [ "$op" = -A ]; then echo "$*" >> "$(f "$c")"
+      else { echo "$*"; cat "$(f "$c")"; } > "$(f "$c").t"; mv "$(f "$c").t" "$(f "$c")"; fi ;;
   -C) c="$1"; shift; [ -f "$(f "$c")" ] && grep -qxF -e "$*" "$(f "$c")" ;;
   -D) c="$1"; shift; grep -qxF -e "$*" "$(f "$c")" || exit 1
       awk -v t="$*" '$0==t && !done {done=1; next} {print}' "$(f "$c")" > "$(f "$c").t"; mv "$(f "$c").t" "$(f "$c")" ;;
@@ -46,18 +48,32 @@ esac
 rc=$?
 # Guard: when $IPT_GUARD lists bridges, every filter -D/-F/-X must leave
 # DOCKER-USER jumping to a chain that drops everything else from each bridge.
+# The guard arms itself once that holds, so it can be set before the first up.
 if [ "$t" = filter ] && [ -f "$IPT_GUARD" ]; then
-  case "$op" in -D|-F|-X)
-    ok=
-    for j in $(sed -n 's/^-j //p' "$d/filter.DOCKER-USER"); do
-      all=1
-      for br in $(cat "$IPT_GUARD"); do
-        grep -qxF -e "-i $br -j DROP" "$d/filter.$j" 2>/dev/null || all=
-      done
-      [ -n "$all" ] && ok=1
+  ok=
+  for j in $(sed -n 's/^-j //p' "$d/filter.DOCKER-USER" 2>/dev/null); do
+    all=1
+    for br in $(cat "$IPT_GUARD"); do
+      grep -qxF -e "-i $br -j DROP" "$d/filter.$j" 2>/dev/null || all=
     done
-    [ -n "$ok" ] || echo "iptables -t filter $op $* left DOCKER-USER without backstop" >> "$IPT_GUARD.violations"
-  esac
+    [ -n "$all" ] && ok=1
+  done
+  if [ -n "$ok" ]; then : > "$IPT_GUARD.armed"
+  elif [ -f "$IPT_GUARD.armed" ]; then
+    case "$op" in -D|-F|-X)
+      echo "iptables -t filter $op $* left DOCKER-USER without backstop" >> "$IPT_GUARD.violations"
+    esac
+  fi
+fi
+# Guard: every MULTIHOP-TPROXY* chain that a chain jumped to from PREROUTING
+# references exists and ends in DROP (never an empty or half-built chain).
+if [ "$t" = mangle ] && [ -f "$IPT_GUARD" ]; then
+  for c in $(sed -n 's/.*-j \(MULTIHOP-[A-Z-]*\)$/\1/p' "$d/mangle.PREROUTING"); do
+    for j in $(sed -n 's/.*-j \(MULTIHOP-TPROXY[A-Z-]*\)$/\1/p' "$d/mangle.$c" 2>/dev/null); do
+      [ "$(tail -n1 "$d/mangle.$j" 2>/dev/null)" = "-j DROP" ] \
+        || echo "iptables -t mangle $op $* left $c jumping to an incomplete $j" >> "$IPT_GUARD.violations"
+    done
+  done
 fi
 exit $rc
 STUB
@@ -376,4 +392,292 @@ R
 @test "unknown command fails" {
   run_script multihop-entry-net sideways
   [ "$status" -eq 2 ]
+}
+
+# --- reality mode (TPROXY into the local Xray) and the Xray reply exception.
+# Exact rules: docs/superpowers/specs/2026-11-03-xray-only-uplink-addendum.md
+# section 3.
+
+# env_with <key=value...>: the base env plus the given keys.
+env_with() {
+  cat > "$MULTIHOP_ENV" <<'ENV'
+PUBLIC_IFACE=eth9
+SSH_PORT=22
+ENTRY_AWG_PORT=51470
+BRIDGES="docker0 amn0"
+ENV
+  printf '%s\n' "$@" >> "$MULTIHOP_ENV"
+}
+
+reality_env() {
+  env_with UPLINK_TRANSPORT=reality ENTRY_XRAY_PORT=443 UPLINK_TPROXY_PORT=12345 \
+    'ENTRY_LOCAL_NETS="172.17.0.0/16 172.29.172.0/24"'
+}
+
+awg_xray_env() {
+  env_with UPLINK_TRANSPORT=awg ENTRY_XRAY_PORT=443 UPLINK_TPROXY_PORT=12345 \
+    'ENTRY_LOCAL_NETS="172.17.0.0/16 172.29.172.0/24"'
+}
+
+# Both guards on from the first up: the iptables one arms itself once the
+# backstop exists; the ip one only once every bridge has its 51820 rule.
+guard_on() {
+  echo "docker0 amn0" > "$IPT_GUARD"
+}
+
+no_violations() {
+  [ ! -f "$IPT_GUARD.violations" ] || { cat "$IPT_GUARD.violations"; false; }
+  [ ! -f "$IP_DIR/violations" ] || { cat "$IP_DIR/violations"; false; }
+}
+
+expected_reality_mark() {
+  cat <<'R'
+-p udp --sport 51470 -j MARK --set-mark 0x5b00/0xff00
+-p tcp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j MARK --set-mark 0x5b00/0xff00
+-p udp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j MARK --set-mark 0x5b00/0xff00
+-m mark --mark 0x5b00/0xff00 -j RETURN
+-m set --match-set multihop_force_exit dst -j MULTIHOP-TPROXY
+-m set --match-set multihop_direct dst -j MARK --set-mark 0x5a/0xff
+-m mark --mark 0x5a/0xff -j RETURN
+-j MULTIHOP-TPROXY
+R
+}
+
+expected_tproxy() {
+  cat <<'R'
+-m addrtype --dst-type LOCAL -j RETURN
+-d 172.17.0.0/16 -j RETURN
+-d 172.29.172.0/24 -j RETURN
+-p tcp -j TPROXY --on-ip 127.0.0.1 --on-port 12345
+-p udp -j TPROXY --on-ip 127.0.0.1 --on-port 12345
+-j DROP
+R
+}
+
+expected_awg_xray_mark() {
+  cat <<'R'
+-p udp --sport 51470 -j MARK --set-mark 0x5b00/0xff00
+-p tcp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j MARK --set-mark 0x5b00/0xff00
+-p udp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j MARK --set-mark 0x5b00/0xff00
+-m set --match-set multihop_force_exit dst -j RETURN
+-m set --match-set multihop_direct dst -j MARK --set-mark 0x5a/0xff
+R
+}
+
+expected_xray_fwd() {
+  cat <<'R'
+-i docker0 -o awg-uplink -j RETURN
+-i docker0 -o docker0 -j RETURN
+-i docker0 -o amn0 -j RETURN
+-i docker0 -o eth9 -m mark --mark 0x5a/0xff -j RETURN
+-i docker0 -o eth9 -p udp --sport 51470 -j RETURN
+-i docker0 -o eth9 -p tcp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j RETURN
+-i docker0 -o eth9 -p udp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j RETURN
+-i amn0 -o awg-uplink -j RETURN
+-i amn0 -o docker0 -j RETURN
+-i amn0 -o amn0 -j RETURN
+-i amn0 -o eth9 -m mark --mark 0x5a/0xff -j RETURN
+-i amn0 -o eth9 -p udp --sport 51470 -j RETURN
+-i amn0 -o eth9 -p tcp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j RETURN
+-i amn0 -o eth9 -p udp -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport 443 -j RETURN
+-i docker0 -j DROP
+-i amn0 -j DROP
+R
+}
+
+# The awg end state: no local route, no TPROXY chain, nothing staged.
+assert_awg_state() {
+  [ "$(cat "$IP_DIR/routes")" = "blackhole default metric 4096 table 51820" ]
+  [ ! -e "$IPT_DIR/mangle.MULTIHOP-TPROXY" ]
+  ! ls "$IPT_DIR" | grep -e '-NEW' || false
+  ! grep -rq -e TPROXY "$IPT_DIR" || false
+}
+
+assert_reality_state() {
+  diff <(sort "$IP_DIR/routes") - <<'R'
+blackhole default metric 4096 table 51820
+local default dev lo table 51820
+R
+  diff "$IPT_DIR/mangle.MULTIHOP-MARK" <(expected_reality_mark)
+  diff "$IPT_DIR/mangle.MULTIHOP-TPROXY" <(expected_tproxy)
+  diff <(sort "$IPT_DIR/mangle.PREROUTING") - <<'R'
+-i amn0 -j MULTIHOP-MARK
+-i docker0 -j MULTIHOP-MARK
+R
+  ! ls "$IPT_DIR" | grep -e '-NEW' || false
+  diff <(sort -s -n -k1,1 "$IP_DIR/rules") <(expected_rules)
+}
+
+@test "reality: table 51820 has local default and blackhole" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  diff <(sort "$IP_DIR/routes") - <<'R'
+blackhole default metric 4096 table 51820
+local default dev lo table 51820
+R
+  # both routes exist before any rule can send traffic to table 51820
+  r=$(first_line '^ip rule add .*lookup 51820$')
+  for re in '^ip route replace blackhole default metric 4096 table 51820$' \
+            '^ip route replace local default dev lo table 51820$'; do
+    n=$(first_line "$re")
+    [ -n "$n" ] && [ -n "$r" ] && [ "$n" -lt "$r" ]
+  done
+  # the ip rules themselves are unchanged
+  diff <(sort -s -n -k1,1 "$IP_DIR/rules") <(expected_rules)
+  no_violations
+}
+
+@test "reality: MULTIHOP-MARK has the addendum layout in order" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  diff "$IPT_DIR/mangle.MULTIHOP-MARK" <(expected_reality_mark)
+  diff <(sort "$IPT_DIR/mangle.PREROUTING") - <<'R'
+-i amn0 -j MULTIHOP-MARK
+-i docker0 -j MULTIHOP-MARK
+R
+  no_violations
+}
+
+@test "reality: MULTIHOP-TPROXY rules exact and installed before MULTIHOP-MARK references it" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  diff "$IPT_DIR/mangle.MULTIHOP-TPROXY" <(expected_tproxy)
+  # the new TPROXY chain is complete before any MARK rule jumps to it, and
+  # MARK is jumped to from PREROUTING only after that
+  done_tp=$(first_line '^iptables -t mangle -A MULTIHOP-TPROXY-NEW -j DROP$')
+  ref=$(first_line '^iptables -t mangle -A MULTIHOP-MARK-NEW .*-j MULTIHOP-TPROXY')
+  jump=$(first_line '^iptables -t mangle -I PREROUTING -i docker0 -j MULTIHOP-MARK-NEW$')
+  [ -n "$done_tp" ] && [ -n "$ref" ] && [ -n "$jump" ]
+  [ "$done_tp" -lt "$ref" ] && [ "$ref" -lt "$jump" ]
+  # backstop still first
+  fwd=$(first_line '^iptables -t filter -I DOCKER-USER -j MULTIHOP-FWD-NEW$')
+  [ "$fwd" -lt "$(first_line '^iptables -t mangle -N MULTIHOP-TPROXY-NEW$')" ]
+  no_violations
+}
+
+@test "reality: up twice converges and retires the old TPROXY chain after the new MARK" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  before=$(snapshot)
+  echo "docker0 amn0" > "$IP_DIR/guard"
+  : > "$STUB_LOG"
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  [ "$(snapshot)" = "$before" ]
+  assert_reality_state
+  swap=$(first_line '^iptables -t mangle -E MULTIHOP-MARK-NEW MULTIHOP-MARK$')
+  old=$(first_line '^iptables -t mangle -X MULTIHOP-TPROXY$')
+  ren=$(first_line '^iptables -t mangle -E MULTIHOP-TPROXY-NEW MULTIHOP-TPROXY$')
+  [ -n "$swap" ] && [ -n "$old" ] && [ -n "$ren" ]
+  [ "$swap" -lt "$old" ] && [ "$old" -lt "$ren" ]
+}
+
+@test "awg: no local route, no MULTIHOP-TPROXY, MULTIHOP-MARK as today plus xray reply rules when ENTRY_XRAY_PORT set" {
+  awg_xray_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  assert_awg_state
+  diff "$IPT_DIR/mangle.MULTIHOP-MARK" <(expected_awg_xray_mark)
+  diff <(sort -s -n -k1,1 "$IP_DIR/rules") <(expected_rules)
+  no_violations
+}
+
+@test "awg is the default transport" {
+  env_with 'ENTRY_LOCAL_NETS="172.17.0.0/16"'
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  assert_awg_state
+}
+
+@test "switch reality -> awg removes local route and MULTIHOP-TPROXY" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  echo "docker0 amn0" > "$IP_DIR/guard"
+  awg_xray_env
+  : > "$STUB_LOG"
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  assert_awg_state
+  diff "$IPT_DIR/mangle.MULTIHOP-MARK" <(expected_awg_xray_mark)
+  # MARK without the jumps is swapped in before TPROXY is dropped
+  swap=$(first_line '^iptables -t mangle -E MULTIHOP-MARK-NEW MULTIHOP-MARK$')
+  drop=$(first_line '^iptables -t mangle -X MULTIHOP-TPROXY$')
+  [ -n "$swap" ] && [ -n "$drop" ] && [ "$swap" -lt "$drop" ]
+}
+
+@test "switch awg -> reality adds them" {
+  awg_xray_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  echo "docker0 amn0" > "$IP_DIR/guard"
+  reality_env
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  assert_reality_state
+}
+
+@test "xray reply exception in MULTIHOP-FWD before the bridge DROP lines; absent when ENTRY_XRAY_PORT empty" {
+  for mode in reality awg; do
+    env_with "UPLINK_TRANSPORT=$mode" ENTRY_XRAY_PORT=443 'ENTRY_LOCAL_NETS="172.17.0.0/16 172.29.172.0/24"'
+    guard_on
+    run_script multihop-entry-net up
+    [ "$status" -eq 0 ]
+    diff "$IPT_DIR/filter.MULTIHOP-FWD" <(expected_xray_fwd)
+    no_violations
+  done
+  for mode in reality awg; do
+    env_with "UPLINK_TRANSPORT=$mode" ENTRY_XRAY_PORT= 'ENTRY_LOCAL_NETS="172.17.0.0/16 172.29.172.0/24"'
+    run_script multihop-entry-net up
+    [ "$status" -eq 0 ]
+    diff "$IPT_DIR/filter.MULTIHOP-FWD" <(expected_fwd)
+    ! grep -q -e conntrack "$IPT_DIR/filter.MULTIHOP-FWD" "$IPT_DIR/mangle.MULTIHOP-MARK" || false
+    no_violations
+  done
+}
+
+@test "no rule anywhere matches --sport 443" {
+  for env in reality_env awg_xray_env; do
+    "$env"; guard_on
+    run_script multihop-entry-net up
+    [ "$status" -eq 0 ]
+    grep -q -e 'ctorigdstport 443' "$IPT_DIR/mangle.MULTIHOP-MARK"
+    ! grep -rqE -e '--sport 443( |$)' "$IPT_DIR" || false
+    ! grep -q -e 'sport 443' "$STUB_LOG" || false
+    no_violations
+  done
+}
+
+@test "reality without ENTRY_LOCAL_NETS fails before changing anything" {
+  env_with UPLINK_TRANSPORT=reality ENTRY_XRAY_PORT=443
+  run_script multihop-entry-net up
+  [ "$status" -ne 0 ]
+  grep -qF "ENTRY_LOCAL_NETS" <<<"$output"
+  ! grep -q -e '^iptables\|^ip \|^ipset' "$STUB_LOG" || false
+}
+
+@test "unknown transport fails before changing anything" {
+  env_with UPLINK_TRANSPORT=wireguard 'ENTRY_LOCAL_NETS="172.17.0.0/16"'
+  run_script multihop-entry-net up
+  [ "$status" -ne 0 ]
+  grep -qF "UPLINK_TRANSPORT" <<<"$output"
+  ! grep -q -e '^iptables\|^ip \|^ipset' "$STUB_LOG" || false
+}
+
+@test "down in reality mode removes the local route and MULTIHOP-TPROXY" {
+  reality_env
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  run_script multihop-entry-net down
+  [ "$status" -eq 0 ]
+  [ ! -s "$IP_DIR/routes" ]
+  [ ! -s "$IPT_DIR/mangle.PREROUTING" ]
+  ! ls "$IPT_DIR" | grep -e MULTIHOP || false
 }
