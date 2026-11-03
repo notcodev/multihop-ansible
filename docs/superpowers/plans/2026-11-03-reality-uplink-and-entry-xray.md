@@ -2,19 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Carry the entry ↔ exit AWG link inside VLESS + REALITY over TCP with BBR (behind a flag), and add an optional, app-managed Amnezia Xray protocol for users on the entry.
+**Goal:** Replace the entry ↔ exit AWG link with an Xray-only VLESS + REALITY transport over TCP with BBR (behind a flag), and add an optional, app-managed Amnezia Xray protocol for users on the entry.
 
 **Architecture:**
-- **Part 1, uplink:** AWG keeps running on top. In `uplink_transport: reality` the entry's AWG peer endpoint becomes a local Xray `tunnel` inbound (`multihop-uplink-xray`), which carries the UDP over VLESS + REALITY to `multihop-exit-xray`. On the exit, `freedom` redirects every packet to the local AWG port.
-- **Part 2, users:** `amnezia-xray` is built from the Amnezia 5.1.0.6 sources, with its state on a host bind mount. It sits on the same Docker bridges as `amnezia-awg2`, so the existing policy routing sends its users' traffic through the uplink. New, narrow firewall exceptions cover its replies.
+- **Part 1, uplink (`uplink_transport: reality`):** bridge traffic from the app containers that is not a reply, direct-listed or local is TPROXY'd on the entry into `multihop-uplink-xray`. Its only outbound is VLESS + REALITY to `multihop-exit-xray`, which sends it to the internet through `freedom`, with private ranges blocked. The AWG uplink container is removed in this mode. `awg` mode is today's behaviour, unchanged.
+- **Part 2, users:** `amnezia-xray` is built from the Amnezia 5.1.0.6 sources, with its state on a host bind mount. It sits on the same bridges, so its users' traffic takes the same path. A narrow conntrack exception covers its replies.
 
-**Tech Stack:** Ansible (ansible-core ≥ 2.21, community.docker, ansible.posix), bash scripts tested with bats, Python filter plugins tested with pytest, Xray-core (`ghcr.io/xtls/xray-core`), amneziawg-go, iptables/ipset/iproute2, systemd.
+**Tech Stack:** Ansible (ansible-core ≥ 2.21, community.docker, ansible.posix), bash scripts tested with bats, Python filter plugins tested with pytest, Xray-core (`ghcr.io/xtls/xray-core`), iptables TPROXY/ipset/iproute2, systemd.
 
-**Spec:** `docs/superpowers/specs/2026-11-03-reality-uplink-and-entry-xray-design.md`. It builds on `docs/superpowers/specs/2026-10-31-multihop-awg-design.md`. Read both before starting.
+**Spec:**
+- `docs/superpowers/specs/2026-11-03-reality-uplink-and-entry-xray-design.md`
+- **`docs/superpowers/specs/2026-11-03-xray-only-uplink-addendum.md`**. The gate selected Xray-only; the addendum replaces design sections 7.1–7.4.
+- Both build on `docs/superpowers/specs/2026-10-31-multihop-awg-design.md`.
+
+Read all three before starting.
 
 ## Global Constraints
 
-- The Task 1 gate decides the uplink shape. If it selects **Xray-only**, stop after Task 1 and report: Tasks 4–6 are replaced by an owner-approved addendum (spec 7.6). Tasks 2, 3 and 7–11 still apply.
+- The gate (Task 1) is done: the result is **Xray-only**. Wherever the design and the addendum differ, the addendum wins.
 - **Target app** is Amnezia **5.1.0.6** (`amnezia-vpn/amnezia-client` tag `5.1.0.6`, commit `ac175c8`). Vendor the Xray `Dockerfile` and `start.sh` from `ac175c8`. The app source tarball is at `/private/tmp/claude-501/-Users-notcodev-Programming-PersonalProjects-multihop-ansible/d4a9d5dd-9b80-4187-b8da-e4d2052edc46/scratchpad/amnezia-src/` (commit `7f9b7db`). Re-download `ac175c8` for the two files that differ (`gh api repos/amnezia-vpn/amnezia-client/tarball/ac175c8`).
 - **Role defaults:**
 
@@ -23,34 +28,52 @@
   | `uplink_transport` | `awg` |
   | `exit_reality_port` | `443` |
   | `uplink_reality_site` | `dl.google.com` |
-  | `uplink_reality_local_port` | `10851` |
+  | `uplink_tproxy_port` | `12345` |
   | `entry_xray_enabled` | `false` |
   | `entry_xray_port` | `443` |
   | `entry_xray_site` | `www.googletagmanager.com` |
   | `entry_xray_state_dir` | `/var/lib/multihop/entry-xray` |
 
   The prod inventory sets `uplink_transport: reality` and `entry_xray_enabled: true`.
-- **Container names:** `multihop-exit-xray`, `multihop-uplink-xray`, `amnezia-xray`. The existing names are unchanged.
-- **Vault blocks:** `vault_link_reality` and `vault_entry_xray`, each `{uuid, private_key, public_key, short_id}`. REALITY keys are X25519 encoded as **base64url without padding** (43 chars); `short_id` is 16 lowercase hex chars; `uuid` is an RFC 4122 v4 string.
-- **Xray image:** `ghcr.io/xtls/xray-core`, pinned by digest in `xray_image_digest` and tagged locally as `multihop/xray:pinned`. It must be release `26.10.31` or later; the REALITY spike used `26.10.31`. Run it with `user: "0:0"`: the image is non-root and could not bind 443.
-- **Xray 26 `freedom` blocks private and loopback destinations for VLESS inbounds unless a `finalRules` `allow` matches.** The exit config needs an explicit allow.
+- **Container names:** `multihop-exit-xray`, `multihop-uplink-xray`, `amnezia-xray`. In `reality` mode `multihop-uplink` (AWG) is absent on the entry, while `multihop-exit` (AWG) keeps running on the exit.
+- **Secrets:**
+
+  | Where | Contents |
+  |---|---|
+  | `vault_link_reality` | `{private_key, public_key, short_id}`, the exit's REALITY identity |
+  | `vault_uplink_entry.reality_uuid` | the entry's VLESS id, in `vault_uplink.yml`; rotated with the AWG uplink key |
+  | `vault_entry_xray` | `{uuid, private_key, public_key, short_id}` |
+
+  REALITY keys are X25519 encoded as **base64url without padding** (43 chars). `short_id` is 16 lowercase hex chars. UUIDs are uuid4 strings.
+- **Xray image:** `ghcr.io/xtls/xray-core`, pinned by digest in `xray_image_digest` and tagged locally as `multihop/xray:pinned`. It must be release `26.10.31` or later. Run it with `user: "0:0"`.
+- **The entry Xray has exactly one outbound,** VLESS + REALITY to the exit: no `freedom`, no other outbound (addendum 3.3).
+- **The exit Xray `freedom` blocks**, via `finalRules` in this order: `169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, <exit ansible_host>/32`, then allows everything else.
 - **BBR:** `net.core.default_qdisc=fq` and `net.ipv4.tcp_congestion_control=bbr` on both servers, persistent, in both transport modes.
 - **Ansible never rewrites app-owned files after first deploy:** `server.json`, `clientsTable`, `xray_*.key`, `awg0.conf`, `wireguard_*.key`.
-- **Fail-closed holds in every mode.** No traffic from the bridges may leave via the entry's IP except: the direct split list, AWG server UDP from `entry_awg_port`, and replies to connections that came in on `entry_xray_port`.
+- **Fail-closed holds in every mode** (addendum 3.3). Nothing from the bridges may leave via the entry's IP except:
+  - the direct split list;
+  - AWG server UDP from `entry_awg_port`;
+  - the REPLY direction of connections DNAT'ed to `entry_xray_port`.
 - **Never run on prod without the owner's go-ahead for that step:** prod is `entry1` 147.45.212.14 and `exit2` 213.182.213.237, with inventory `inventories/prod`. The lab is `tests/integration/run.sh`.
 - Use the existing test entry points: `make test` (pytest + bats) and `make lint` (shellcheck, ansible-lint, syntax checks). Both must pass at the end of every task.
 
 ## Review Focus
 
-1. **Existing vaults lack the new blocks.** Running `entry.yml`/`exit.yml` with `uplink_transport: reality` or `entry_xray_enabled: true` on a vault without `vault_link_reality`/`vault_entry_xray` must fail early with a message that names `scripts/gen-secrets.py xray`, not with a Jinja undefined error. Tests: Task 4 and Task 8.
-2. **Rollback from `reality` to `awg`.** Re-running with `uplink_transport: awg` must restore the direct AWG endpoint, remove `multihop-uplink-xray`/`multihop-exit-xray`, and keep `multihop-reresolve` behaving as before. Test: Task 5 render test plus a lab check in Task 10.
+1. **Existing vaults lack the new blocks.** Running `entry.yml`/`exit.yml` with `uplink_transport: reality` or `entry_xray_enabled: true` on a vault without `vault_link_reality`, `vault_uplink_entry.reality_uuid` or `vault_entry_xray` must fail early with a message that names the `gen-secrets.py` subcommand to run, not with a Jinja undefined error. Tests: Tasks 4 and 8.
+2. **Rollback from `reality` to `awg`.** Re-running with `uplink_transport: awg` must:
+   - remove the `local` route from table 51820 and `MULTIHOP-TPROXY`;
+   - restore `multihop-uplink` and its `default dev awg-uplink` route;
+   - remove `multihop-uplink-xray`;
+   - keep `multihop-reresolve` behaving as before.
+
+   Tests: Task 5 bats (mode switch both ways) and a lab check in Task 10.
 3. **Restoring an old backup that has no `xray/` directory** with `entry_xray_enabled: true` must restore AWG and seed Xray from the vault. A backup with `xray/` while Xray is disabled must restore AWG and skip Xray with a notice. Tests: Task 9.
-4. **Port collisions.** `entry_xray_port` equal to `ssh_port`, any `extra_input_tcp_ports` entry, or the internal `uplink_reality_local_port` must be refused before anything changes. Test: Task 8.
+4. **Port collisions.** `entry_xray_port` equal to `ssh_port`, any `extra_input_tcp_ports` entry, or `uplink_tproxy_port` must be refused before anything changes. Test: Task 8.
 5. **The app restarts `amnezia-xray`** (`docker restart`, as it does on every user change). Afterwards the bind mount, the ephemeral port range that excludes `entry_awg_port`, and BBR must still be in effect. Test: Task 10 lab check.
 
 ---
 
-### Task 1: Gate on prod — AWG-over-REALITY vs Xray-only (operational, no repo changes)
+### Task 1 (DONE — result: Xray-only, see addendum section 1): Gate on prod — AWG-over-REALITY vs Xray-only (operational, no repo changes)
 
 **Files:** none committed. Scripts live in the scratchpad.
 
@@ -87,8 +110,8 @@
 **Files:**
 - Create: `plugins/filter/xray.py`
 - Modify: `scripts/gen-secrets.py`
-- Modify: `inventories/example/group_vars/all/vault.yml.example`
-- Modify: `tests/render/fixture_vars.yml` (add both vault blocks with fixed fake values)
+- Modify: `inventories/example/group_vars/all/vault.yml.example` (also the `vault_uplink.yml` example comment)
+- Modify: `tests/render/fixture_vars.yml` (add `vault_link_reality`, `vault_entry_xray` and `vault_uplink_entry.reality_uuid` with fixed fake values)
 - Test: `tests/test_xray_filter.py` (create), `tests/test_gen_secrets.py`
 
 **Interfaces:**
@@ -100,25 +123,28 @@
   - `xray_port_range(awg_port: int) -> str`: `"1024 <awg_port-1>"` when `awg_port - 1 - 1024 >= 10000`, else `"<awg_port+1> 65535"`. Same rule as `roles/entry_app/templates/start.sh.j2`.
   - `FilterModule` exposing `xray_port_range`.
 - Produces, in `scripts/gen-secrets.py`:
-  - Subcommand `xray`, printing a YAML document with exactly `vault_link_reality` and `vault_entry_xray`.
-  - `all` also includes both blocks.
+  - `xray` prints a YAML document with exactly `vault_link_reality` (`private_key`, `public_key`, `short_id`) and `vault_entry_xray` (`uuid`, `private_key`, `public_key`, `short_id`).
+  - `uplink-key` prints `vault_uplink_entry` with `private_key`, `public_key` **and `reality_uuid`**.
+  - `all` includes `vault_link_reality` and `vault_entry_xray`.
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_xray_filter.py`:
   - `test_reality_key_roundtrip`: decode `reality_genkey()` with `base64.urlsafe_b64decode(k + "=")` to exactly 32 bytes. The key is 43 chars with no `=`, `+` or `/`. `reality_pubkey` gives the same result as the `cryptography` X25519 public key encoded the same way.
-  - `test_reality_pubkey_known_vector`: a fixed private key maps to a fixed public key. Generate the vector once with `docker run --rm ghcr.io/xtls/xray-core:latest x25519 -i <priv>` and hardcode both values.
+  - `test_reality_pubkey_known_vector`: a fixed private key maps to a fixed public key. Generate the vector once with `docker run --rm ghcr.io/xtls/xray-core:latest x25519 -i <priv>` (on any host with docker; ask the controller if none is available) and hardcode both values.
   - `test_short_id_hex16`: matches `^[0-9a-f]{16}$`.
   - `test_xray_port_range`: `xray_port_range(51820) == "1024 51819"` and `xray_port_range(5000) == "5001 65535"`.
 
   In `tests/test_gen_secrets.py`:
-  - `test_xray_subcommand_doc`: the keys are exactly `{"vault_link_reality", "vault_entry_xray"}`; in each, `public_key == reality_pubkey(private_key)`; the two blocks share no value.
-  - `test_all_outputs_valid_vault_doc` also asserts both keys.
-- [ ] **Step 2: Run** `uv run pytest tests/test_xray_filter.py tests/test_gen_secrets.py -v`. Expected: FAIL (module missing).
-- [ ] **Step 3: Implement** `plugins/filter/xray.py`, reusing the X25519 primitives already imported in `awg.py`. Then add the `xray` subcommand and extend `all` in `scripts/gen-secrets.py`. Update the usage docstring.
-- [ ] **Step 4: Add both blocks with obviously fake values** to `vault.yml.example`, with comments:
-  - `vault_link_reality` is the exit identity of the REALITY link; the exit is rebuilt from it.
-  - `vault_entry_xray` seeds the first deploy only.
-
-  Also add both blocks to `tests/render/fixture_vars.yml`.
+  - `test_xray_subcommand_doc`: the keys are exactly `{"vault_link_reality", "vault_entry_xray"}`, with the key sets listed above; each `public_key == reality_pubkey(private_key)`; no value is shared between blocks.
+  - `test_uplink_key_doc` also asserts that `reality_uuid` is a valid uuid4.
+  - `test_all_outputs_valid_vault_doc` also asserts both new blocks.
+- [ ] **Step 2: Run** `uv run pytest tests/test_xray_filter.py tests/test_gen_secrets.py -v`. Expected: FAIL.
+- [ ] **Step 3: Implement** `plugins/filter/xray.py`, reusing the X25519 primitives already imported in `awg.py`. Then extend `scripts/gen-secrets.py` and update its usage docstring.
+- [ ] **Step 4: Update the examples.**
+  - Add both blocks with obviously fake values to `vault.yml.example`, with comments:
+    - `vault_link_reality` is the exit's REALITY identity; the exit is rebuilt from it.
+    - `vault_entry_xray` seeds the first deploy only.
+  - Mention `reality_uuid` in the `vault_uplink.yml` comment there.
+  - Add all three to `tests/render/fixture_vars.yml`.
 - [ ] **Step 5: Run** `uv run pytest tests -q`. Expected: all pass.
 - [ ] **Step 6: Commit** with `git commit -m "feat: generate REALITY and entry Xray secrets"`.
 
@@ -152,116 +178,162 @@
 ### Task 4: Exit — REALITY server `multihop-exit-xray`
 
 **Files:**
-- Create: `roles/exit/templates/xray-exit.json.j2`
+- Create: `roles/exit/templates/xray-exit.json.j2`, `roles/common/tasks/assert-vault.yml`, `tests/render/assert_vault.yml`
 - Modify: `roles/exit/tasks/main.yml`, `roles/exit/defaults/main.yml`, `roles/exit/handlers/main.yml`, `playbooks/exit.yml`
-- Test: `tests/test_render.py`
+- Test: `tests/test_render.py`, `tests/test_playbooks.py`
 
 **Interfaces:**
-- Consumes: `vault_link_reality` (Task 2), `multihop/xray:pinned` and `common_input_tcp_ports` (Task 3).
+- Consumes: `vault_link_reality` and `vault_uplink_entry.reality_uuid` (Task 2); `multihop/xray:pinned` and `common_input_tcp_ports` (Task 3).
 - Produces:
-  - Container `multihop-exit-xray`: host network, `restart_policy: always`, `user: "0:0"`, config at `{{ exit_state_dir }}/xray-exit.json` mounted read-only, command `run -c /etc/xray/config.json`.
-  - Handler `Restart multihop-exit-xray`.
-  - When `uplink_transport != 'reality'`: the container is `absent`.
+  - `roles/common/tasks/assert-vault.yml`, with inputs:
+    - `assert_vault_var`: a variable name;
+    - `assert_vault_keys`: a list of required keys;
+    - `assert_vault_hint`: the gen-secrets command to name.
 
-- [ ] **Step 1: Write the failing test `test_exit_xray_config`.** Render with fixture vars plus `exit_awg_port: 51821` and `exit_reality_port: 443`, then `json.loads` the result. Assert:
+    It asserts the variable is defined, is a mapping, and has non-empty values for all keys. Otherwise it fails with `fail_msg` "<var> is missing <keys>: run `<hint>` and add the output to the vault".
+  - Container `multihop-exit-xray`: host network, `restart_policy: always`, `user: "0:0"`, config `{{ exit_state_dir }}/xray-exit.json` mounted read-only at `/etc/xray/config.json`, command `run -c /etc/xray/config.json`.
+  - Handler `Restart multihop-exit-xray`.
+  - In `uplink_transport: awg` mode, `multihop-exit-xray` is `absent`. In both modes `multihop-exit` (AWG) runs as today.
+
+- [ ] **Step 1: Write the failing test `test_exit_xray_config`.** Render with fixture vars plus `exit_reality_port: 443` and `ansible_host: 198.51.100.7`, then `json.loads` the result. Assert:
   - The single inbound has `port == 443`, `protocol == "vless"` and `settings.decryption == "none"`.
-  - `settings.clients == [{"id": <fixture uuid>, "flow": "xtls-rprx-vision"}]`.
+  - `settings.clients == [{"id": <fixture vault_uplink_entry.reality_uuid>, "flow": "xtls-rprx-vision"}]`.
   - `streamSettings.network == "raw"` and `security == "reality"`.
   - `realitySettings.target == "dl.google.com:443"`, `serverNames == ["dl.google.com"]`, `privateKey == <fixture>`, `shortIds == [<fixture short_id>]`.
-  - `realitySettings.limitFallbackUpload` and `limitFallbackDownload` are present with `afterBytes > 0`.
-  - The only outbound is `freedom`, with `settings.redirect == "127.0.0.1:51821"` and `settings.finalRules == [{"action": "allow", "network": "udp", "ip": ["127.0.0.1"], "port": "51821"}, {"action": "block"}]`.
-- [ ] **Step 2: Write the failing test `test_missing_xray_vault_message`** (in `tests/test_playbooks.py`). It runs `ansible-playbook -i localhost, -e ansible_connection=local tests/render/assert_vault.yml -e '{"assert_vault_block": "vault_link_reality"}'`, a new two-line play that includes `roles/common/tasks/assert-vault.yml`. Expect a non-zero rc and `gen-secrets.py xray` in the output. With `-e '{"vault_link_reality": {"uuid": "u", "private_key": "p", "public_key": "q", "short_id": "s"}}'` added, expect rc 0.
-- [ ] **Step 3: Run the tests.** Expected: FAIL.
+  - `realitySettings.limitFallbackUpload` and `limitFallbackDownload` each have `afterBytes > 0` and `bytesPerSec > 0`.
+  - The only outbound is `freedom`, with `settings.finalRules == [{"action": "block", "ip": ["169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "198.51.100.7/32"]}, {"action": "allow"}]`.
+  - There is no `redirect`.
+- [ ] **Step 2: Write the failing test `test_missing_reality_vault_message`** (in `tests/test_playbooks.py`). Run `ansible-playbook -i localhost, -e ansible_connection=local tests/render/assert_vault.yml -e '{"assert_vault_var": "vault_link_reality", "assert_vault_keys": ["private_key", "public_key", "short_id"], "assert_vault_hint": "uv run scripts/gen-secrets.py xray"}'`. Expect a non-zero rc and `gen-secrets.py xray` in the output. Re-run with a full `vault_link_reality` added; expect rc 0.
+- [ ] **Step 3: Run** the tests. Expected: FAIL.
 - [ ] **Step 4: Implement.**
-  - Create `roles/common/tasks/assert-vault.yml`. Input `assert_vault_block` (a variable name); it asserts that the variable is defined and has all four keys, with a `fail_msg` telling the owner to run `uv run scripts/gen-secrets.py xray` and add the output to the vault. Create `tests/render/assert_vault.yml`.
-  - Write the template and tasks. The exit role starts with `include_tasks: ../../common/tasks/assert-vault.yml` with `assert_vault_block: vault_link_reality`, gated on `uplink_transport == 'reality'`.
+  - The exit role starts, in `reality` mode, with two includes of `assert-vault.yml`:
+    - `vault_link_reality` with the three keys and hint `uv run scripts/gen-secrets.py xray`;
+    - `vault_uplink_entry` with `[reality_uuid]` and hint `uv run scripts/gen-secrets.py uplink-key > .../vault_uplink.yml` (it rotates the AWG uplink key too; deploy the exit, then the entry).
+  - Write the template and tasks.
   - In `playbooks/exit.yml`, pass `common_input_tcp_ports: "{{ [exit_reality_port] if uplink_transport == 'reality' else [] }}"` to the common role.
-  - The exit's public AWG port stays open (designer's call; spec 7.2). The README in Task 11 says so.
+  - Check the Xray 26 field names (`finalRules`, `limitFallback*`, `raw`) against context7 `/xtls/xray-docs-next` before writing.
 - [ ] **Step 5: Run** `make test lint`. Expected: pass.
 - [ ] **Step 6: Commit** with `git commit -m "feat: REALITY server on the exit"`.
 
-### Task 5: Entry — REALITY client `multihop-uplink-xray`, AWG endpoint and re-resolve
+### Task 5: Entry routing — TPROXY into Xray (reality mode) and the Xray reply exception (both modes)
 
 **Files:**
-- Create: `roles/entry_uplink/templates/xray-uplink.json.j2`
-- Modify: `roles/entry_uplink/templates/awg-uplink.conf.j2`, `roles/entry_uplink/tasks/main.yml`, `roles/entry_uplink/defaults/main.yml`, `roles/entry_uplink/handlers/main.yml`, `roles/entry_uplink/files/multihop-reresolve`
-- Test: `tests/test_render.py`, `tests/bats/reresolve.bats`
-
-**Interfaces:**
-- Consumes: `vault_link_reality` (Task 2), the image (Task 3).
-- Produces:
-  - Container `multihop-uplink-xray`: host network, `user: "0:0"`, `restart_policy: always`. It is started **before** `multihop-uplink` in `reality` mode and is `absent` in `awg` mode.
-  - New keys in the `uplink` block of `multihop.env`: `UPLINK_TRANSPORT`, `UPLINK_XRAY_CONTAINER=multihop-uplink-xray`.
-  - State file `{{ entry_uplink_state_dir }}/exit-ip`, written by `multihop-reresolve`.
-
-- [ ] **Step 1: Write the failing render tests.**
-  - `test_uplink_conf_endpoint_by_transport`: with `uplink_transport: awg` the `[Peer]` has `Endpoint = <exit_domain>:<exit_awg_port>`; with `reality` it has `Endpoint = 127.0.0.1:10851`. Everything else is identical between the two renders.
-  - `test_uplink_xray_config`: `json.loads` the rendered `xray-uplink.json.j2`.
-    - Inbound: `listen == "127.0.0.1"`, `port == 10851`, `protocol == "tunnel"`, `settings == {"allowedNetwork": "udp", "rewriteAddress": "127.0.0.1", "rewritePort": <exit_awg_port>}`.
-    - Outbound: `vless` to `address == <exit_domain>` and `port == exit_reality_port`, with user `id == <uuid>`, `flow == "xtls-rprx-vision"`, `encryption == "none"`.
-    - Outbound stream: `network == "raw"` and `security == "reality"`, with `realitySettings` exactly `{"serverName": "dl.google.com", "fingerprint": "chrome", "password": <public_key>, "shortId": <short_id>}`. It must have no `target` key.
-    - A `policy.levels."0".connIdle` of at least 300.
-- [ ] **Step 2: Write the failing bats tests** in `tests/bats/reresolve.bats`, using the existing stub style:
-  - `reality mode restarts uplink xray when the exit IP changes`: `UPLINK_TRANSPORT=reality`; `getent` returns `203.0.113.9`; the `exit-ip` file holds `203.0.113.8`. Expect `docker restart multihop-uplink-xray`, no `awg set ... endpoint`, and the file now holds `203.0.113.9`.
-  - `reality mode does nothing when the IP is unchanged`: no docker call.
-  - `reality mode keeps the endpoint on a failed resolve`: nothing is restarted and the file is unchanged.
-  - The existing AWG-mode tests still pass, with `UPLINK_TRANSPORT` unset or `awg`.
-- [ ] **Step 3: Run** `uv run pytest tests/test_render.py -k uplink -v` and `bats tests/bats/reresolve.bats`. Expected: new tests FAIL.
-- [ ] **Step 4: Implement the templates, tasks and script branch.**
-  - The state-file path comes from the env as `UPLINK_STATE_DIR`.
-  - Include `roles/common/tasks/assert-vault.yml` with `assert_vault_block: vault_link_reality` (Task 4), gated on `reality`.
-  - In `awg` mode, remove `multihop-uplink-xray`.
-  - In `reality` mode, the re-resolve timer runs the new branch.
-- [ ] **Step 5: Run** `make test lint`. Expected: pass.
-- [ ] **Step 6: Commit** with `git commit -m "feat: AWG uplink over REALITY on the entry"`.
-
-### Task 6: Swap and verify playbooks for both transports; fix the old-exit tug-of-war
-
-**Files:**
-- Modify: `playbooks/swap-exit.yml`, `playbooks/swap-entry.yml`, `playbooks/verify.yml`, `playbooks/tasks/verify-entry.yml`
-- Test: `tests/test_playbooks.py`
-
-**Interfaces:**
-- Consumes: the container names and `UPLINK_TRANSPORT` from Tasks 4–5.
-- Produces, in `swap-exit.yml`, after the DNS step:
-  1. On the entry, `resolvectl flush-caches`, ignoring a missing resolvectl.
-  2. In `reality` mode, `docker restart multihop-uplink-xray`, then wait until `ss -Htn state established dst <new exit ip> dport = :<exit_reality_port>` is non-empty (up to 5 min), followed by a fresh AWG handshake (`wait-handshake.yml` without `wait_handshake_endpoint`).
-  3. In `awg` mode, the existing endpoint wait.
-  4. **In both modes, if `exit_old` has a host:** stop `multihop-exit` on it (and `multihop-exit-xray` if present) **before** the handshake wait. Keep its restart policy unless `stop_old=yes`, which sets `restart_policy: "no"` as today.
-
-- [ ] **Step 1: Write the failing tests** in `tests/test_playbooks.py`, parsing YAML structure as the existing tests there do:
-  - `test_swap_exit_stops_old_before_handshake_wait`: in task order, the "stop old exit" task comes before the first `wait-handshake.yml` include.
-  - `test_swap_exit_flushes_entry_resolver`: a task on `hosts: entry` runs `resolvectl flush-caches`, after the DNS update play.
-  - `test_verify_fail_closed_stops_uplink_xray_in_reality_mode`: the fail-closed block stops `multihop-uplink-xray` when `uplink_transport == 'reality'`, and starts it again in `always`.
-- [ ] **Step 2: Run** the tests. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-  - `verify-entry.yml`: in `reality` mode, assert `multihop-uplink-xray` is running and an established TCP connection to the exit exists. The egress-IP check is unchanged.
-  - `swap-entry.yml`: no REALITY credential rotation. The new entry gets `multihop-uplink-xray` through `entry.yml`.
-- [ ] **Step 4: Run** `make test lint`. Expected: pass.
-- [ ] **Step 5: Commit** with `git commit -m "fix: exit swap with REALITY and with the old exit still running"`.
-
-### Task 7: Entry firewall — Xray reply exception
-
-**Files:**
-- Modify: `roles/entry_uplink/files/multihop-entry-net`, the `uplink` block in `roles/entry_uplink/tasks/main.yml` (add `ENTRY_XRAY_PORT`, empty when Xray is disabled)
+- Modify: `roles/entry_uplink/files/multihop-entry-net`
+- Modify: the `uplink` block in `roles/entry_uplink/tasks/main.yml`. Add:
+  - `UPLINK_TRANSPORT`;
+  - `UPLINK_TPROXY_PORT`;
+  - `ENTRY_LOCAL_NETS`: the bridges' subnets, from `community.docker.docker_network_info` for `bridge` and `entry_app_network`, space-separated. The network is created earlier by `entry_app`; if it does not exist yet, use `entry_app_network_subnet`.
+  - `ENTRY_XRAY_PORT`: empty unless `entry_xray_enabled`.
 - Test: `tests/bats/entry_net.bats`
 
 **Interfaces:**
-- Consumes: `ENTRY_XRAY_PORT` from `multihop.env`.
-- Produces, only when `ENTRY_XRAY_PORT` is non-empty, these rules for each of `tcp` and `udp`:
-  - **MULTIHOP-MARK** (first, before the force_exit `RETURN`): `-p <proto> -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport $ENTRY_XRAY_PORT -j MARK --set-mark $REPLY_MARK`.
-  - **MULTIHOP-FWD**, per bridge: `-i $br -o $PUBLIC_IFACE -p <proto> -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport $ENTRY_XRAY_PORT -j RETURN`.
-  - The AWG UDP rules are unchanged; the AWG ↔ Xray port collision is handled in Task 8 by the container's port range.
+- Consumes: the env keys above.
+- Produces, exactly as in addendum section 3:
+  - In `reality` mode, table 51820 has `local default dev lo` plus the existing blackhole.
+  - `MULTIHOP-MARK` uses the addendum 3.2 layout in reality mode. In awg mode it keeps today's rules, plus the two conntrack reply rules whenever `ENTRY_XRAY_PORT` is set.
+  - New chain `MULTIHOP-TPROXY`, in reality mode only.
+  - `MULTIHOP-FWD` gains, whenever `ENTRY_XRAY_PORT` is set and per bridge before its DROP, for each of tcp and udp: `-i $br -o $PUBLIC_IFACE -p <proto> -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport $ENTRY_XRAY_PORT -j RETURN`.
+  - `up` in awg mode removes any `local default` route from table 51820 and drops `MULTIHOP-TPROXY`. `down` removes both.
 
-- [ ] **Step 1: Write the failing bats tests:**
-  - `xray reply exception present when ENTRY_XRAY_PORT is set`: with `ENTRY_XRAY_PORT=443` in the env, both chains contain the exact rules above for tcp and udp, and the FWD rules sit before the per-bridge `-j DROP` lines.
-  - `no xray exception when ENTRY_XRAY_PORT is empty`: no rule mentions `ctorigdstport`.
-  - `no bare source-port 443 rule`: nothing matches `--sport 443`.
-  - The existing backstop guard (`IPT_GUARD`) still reports no violations.
-- [ ] **Step 2: Run** `bats tests/bats/entry_net.bats`. Expected: FAIL.
-- [ ] **Step 3: Implement** in `fwd_rules` and the `MULTIHOP-MARK` heredoc. Update the header comment to list the third exception and why it is safe: only the REPLY direction of connections that docker DNAT'ed from the published port; Xray never initiates from that port.
+- [ ] **Step 1: Write the failing bats tests.** Extend the fake `ip` in the test setup to keep table-51820 routes by type if needed.
+  - `reality: table 51820 has local default and blackhole`
+  - `reality: MULTIHOP-MARK has the addendum layout in order`: assert the exact rule list, in order, for `ENTRY_AWG_PORT=51470`, `ENTRY_XRAY_PORT=443`, `UPLINK_TPROXY_PORT=12345`, `ENTRY_LOCAL_NETS="172.17.0.0/16 172.29.172.0/24"`.
+  - `reality: MULTIHOP-TPROXY rules exact and installed before MULTIHOP-MARK references it`
+  - `awg: no local route, no MULTIHOP-TPROXY, MULTIHOP-MARK as today plus xray reply rules when ENTRY_XRAY_PORT set`
+  - `switch reality -> awg removes local route and MULTIHOP-TPROXY`
+  - `switch awg -> reality adds them`
+  - `xray reply exception in MULTIHOP-FWD before the bridge DROP lines; absent when ENTRY_XRAY_PORT empty`
+  - `no rule anywhere matches --sport 443`
+  - The existing `IPT_GUARD` backstop check reports no violations in all of the above.
+- [ ] **Step 2: Run** `bats tests/bats/entry_net.bats`. Expected: new tests FAIL, existing tests pass.
+- [ ] **Step 3: Implement** in `multihop-entry-net`.
+  - Keep the ordering guarantees in its header: the backstop and blackhole come before any rule, and chains are swapped atomically.
+  - Update the header comment with the reality-mode paths and the fail-closed argument (addendum 3.3, in brief).
+  - Add `ENTRY_XRAY_PORT`, `UPLINK_TRANSPORT`, `UPLINK_TPROXY_PORT` and `ENTRY_LOCAL_NETS` to the role's env block.
 - [ ] **Step 4: Run** `make test lint`. Expected: pass.
-- [ ] **Step 5: Commit** with `git commit -m "feat: fail-closed exception for Xray server replies"`.
+- [ ] **Step 5: Commit** with `git commit -m "feat: TPROXY uplink routing and Xray reply exception on the entry"`.
+
+### Task 6: Entry — `multihop-uplink-xray` container, mode switch and re-resolve
+
+**Files:**
+- Create: `roles/entry_uplink/templates/xray-uplink.json.j2`
+- Modify: `roles/entry_uplink/tasks/main.yml`, `roles/entry_uplink/defaults/main.yml`, `roles/entry_uplink/handlers/main.yml`, `roles/entry_uplink/files/multihop-reresolve`
+- Test: `tests/test_render.py`, `tests/bats/reresolve.bats`
+
+**Interfaces:**
+- Consumes: `vault_link_reality`, `vault_uplink_entry.reality_uuid` (Task 2); the image (Task 3); `assert-vault.yml` (Task 4); the env keys (Task 5).
+- Produces:
+  - **Reality mode:**
+    - `multihop-uplink-xray` runs: host network, `user: "0:0"`, `capabilities: [NET_ADMIN]`, `restart_policy: always`.
+    - `multihop-uplink` (AWG) is `absent`.
+    - Order: `multihop-net` first (already the case), then the container.
+  - **AWG mode:** the reverse, with `multihop-uplink` exactly as today.
+  - Env key `UPLINK_STATE_DIR`.
+  - State file `{{ entry_uplink_state_dir }}/exit-ip`, written by `multihop-reresolve`.
+
+- [ ] **Step 1: Write the failing render test `test_uplink_xray_config`.** `json.loads` the rendered `xray-uplink.json.j2` and assert:
+  - **Exactly one inbound:**
+    - `listen == "127.0.0.1"`, `port == 12345`, `protocol == "tunnel"`;
+    - `settings.network == "tcp,udp"` and `settings.followRedirect is True`;
+    - `streamSettings.sockopt.tproxy == "tproxy"`;
+    - no `sniffing`, or `sniffing.enabled is False`.
+  - **Exactly one outbound:**
+    - `protocol == "vless"` to `address == <exit_domain>` and `port == 443`;
+    - user `id == <fixture reality_uuid>`, `flow == "xtls-rprx-vision"`, `encryption == "none"`;
+    - stream `network == "raw"` and `security == "reality"`;
+    - `realitySettings` exactly `{"serverName": "dl.google.com", "fingerprint": "chrome", "password": <vault_link_reality.public_key>, "shortId": <short_id>}`, with no `target` key.
+  - **No `freedom` or `blackhole` outbound anywhere.**
+  - `policy.levels."0".connIdle >= 300`.
+
+  Check the tunnel/dokodemo transparent-proxy field names against context7 `/xtls/xray-docs-next` first. If a name differs, use the documented one and say so in the report.
+- [ ] **Step 2: Write the failing bats tests** in `tests/bats/reresolve.bats`:
+  - `reality mode restarts uplink xray when the exit IP changes`: `UPLINK_TRANSPORT=reality`, `getent` returns `203.0.113.9`, the `exit-ip` file holds `203.0.113.8`. Expect `docker restart multihop-uplink-xray`, no `awg` call, and the file now holds `203.0.113.9`.
+  - `reality mode first run records the IP without a restart`: the file is absent; it is written and docker is not called.
+  - `reality mode does nothing when the IP is unchanged`
+  - `reality mode keeps everything on a failed resolve`
+  - The existing AWG-mode tests still pass.
+- [ ] **Step 3: Run** `uv run pytest tests/test_render.py -k uplink -v` and `bats tests/bats/reresolve.bats`. Expected: new tests FAIL.
+- [ ] **Step 4: Implement the template, the mode-dependent container tasks and the reresolve branch.**
+  - In reality mode, start with the two `assert-vault.yml` includes from Task 4.
+  - `awg-uplink.conf` is still rendered in reality mode (cheap, and keeps the rollback a one-variable change), but no container uses it.
+- [ ] **Step 5: Run** `make test lint`. Expected: pass.
+- [ ] **Step 6: Commit** with `git commit -m "feat: Xray uplink container on the entry"`.
+
+### Task 7: Swap and verify playbooks for both transports; fix the old-exit tug-of-war (awg mode)
+
+**Files:**
+- Modify: `playbooks/swap-exit.yml`, `playbooks/verify.yml`, `playbooks/tasks/verify-entry.yml`
+- Test: `tests/test_playbooks.py`
+
+**Interfaces:**
+- Consumes: container names and `uplink_transport` (Tasks 4–6).
+- Produces, in `swap-exit.yml` after the DNS play:
+  1. On the entry: `resolvectl flush-caches` (ignore a missing resolvectl).
+  2. **Reality mode:**
+     - `docker restart multihop-uplink-xray`;
+     - generate traffic: a curl to the IP echo URL from inside `amnezia-awg2`, as `verify-entry.yml` does;
+     - wait up to 5 min until `ss -Htn state established dst <new exit ip> dport = :<exit_reality_port>` on the entry is non-empty;
+     - no AWG handshake waits.
+  3. **AWG mode:**
+     - **if `exit_old` has a host, stop `multihop-exit` on it before the handshake waits**; keep its restart policy unless `stop_old=yes`, which also sets `restart_policy: "no"` as today;
+     - then the existing endpoint and handshake waits.
+- Produces, in `verify-entry.yml`:
+  - **Reality mode:**
+    - `multihop-uplink-xray` is running and `ss -Hltn sport = :<uplink_tproxy_port>` on the entry is non-empty;
+    - the egress IP from `amnezia-awg2` (and `amnezia-xray` when enabled) is the exit's IPv4;
+    - on the exit, an established TCP connection from the entry's IPv4 to `exit_reality_port` exists. This takes the place of the awg-exit byte-counter checks.
+  - **AWG mode:** unchanged.
+- Produces, in `verify.yml`: the fail-closed block stops `multihop-uplink-xray` in reality mode (`multihop-uplink` in awg mode) and restarts it in `always`.
+
+- [ ] **Step 1: Write the failing tests** in `tests/test_playbooks.py`, parsing the YAML structure as the existing tests there do:
+  - `test_swap_exit_flushes_entry_resolver`: a task on the entry runs `resolvectl flush-caches`, after the DNS update play.
+  - `test_swap_exit_awg_stops_old_before_handshake_wait`: in awg mode, the stop-old-exit task comes before the first `wait-handshake.yml` include.
+  - `test_swap_exit_reality_restarts_uplink_xray_and_waits_for_connection`
+  - `test_verify_fail_closed_stops_uplink_xray_in_reality_mode`
+- [ ] **Step 2: Run** the tests. Expected: FAIL.
+- [ ] **Step 3: Implement.** `swap-entry.yml` needs no change: the UUID rotates through `gen-secrets.py uplink-key` (Task 2).
+- [ ] **Step 4: Run** `make test lint`. Expected: pass.
+- [ ] **Step 5: Commit** with `git commit -m "feat: swap and verify for the Xray uplink; fix exit swap with the old exit running"`.
 
 ### Task 8: Role `entry_xray` — app-compatible `amnezia-xray`
 
@@ -304,10 +376,10 @@
   - `realitySettings` must be exactly `{"dest": "www.googletagmanager.com:443", "privateKey": <vault>, "serverNames": ["www.googletagmanager.com"], "shortIds": [<vault short_id>]}`.
   - Keep this expected JSON as `tests/fixtures/amnezia-xray-server.json`, with the fixture vault values.
 - [ ] **Step 2: Write the failing test `test_entry_xray_start_sh`.** `start.sh.j2` rendered with `entry_xray_port: 443` equals the vendored `start.sh` with `$XRAY_SERVER_PORT` replaced by `443`, and nothing else differs.
-- [ ] **Step 3: Write the failing test `test_entry_xray_port_collision_refused`.** Put the port checks in `roles/entry_xray/tasks/checks.yml`, which also includes `assert-vault.yml` with `assert_vault_block: vault_entry_xray`. Run them through a small play `tests/render/entry_xray_checks.yml`, the same way as Task 4's test. Each of these must give a non-zero rc with the offending variable named in the output:
+- [ ] **Step 3: Write the failing test `test_entry_xray_port_collision_refused`.** Put the port checks in `roles/entry_xray/tasks/checks.yml`, which also includes `roles/common/tasks/assert-vault.yml` (Task 4 interface) with `assert_vault_var: vault_entry_xray`, `assert_vault_keys: [uuid, private_key, public_key, short_id]` and `assert_vault_hint: uv run scripts/gen-secrets.py xray`. Run them through a small play `tests/render/entry_xray_checks.yml`, the same way as Task 4's test. Each of these must give a non-zero rc with the offending variable named in the output:
   - `entry_xray_port` = `ssh_port`;
   - `entry_xray_port` in `extra_input_tcp_ports`;
-  - `entry_xray_port` = `uplink_reality_local_port`;
+  - `entry_xray_port` = `uplink_tproxy_port`;
   - a missing `vault_entry_xray`.
 
   The fixture values give rc 0.
@@ -363,25 +435,41 @@
 **Interfaces:**
 - Consumes: everything above.
 - Produces new `run.sh check` names, with `PASS`/`FAIL` evidence in the existing style:
-  - `reality_uplink`: AWG handshake through `multihop-uplink-xray`, an established TCP connection to the exit's REALITY port, egress = exit IP.
-  - `reality_throughput`: `iperf3 -R -P 4 -t 20` from entry to `<uplink .1>`; record the number.
-  - `xray_client_via_exit`: add a VLESS client the way the app does (append a client to `server.json`, then `docker restart amnezia-xray`). A stock Xray client container on `CLIENT_IP`, built from `xray-client.json.j2` with a SOCKS inbound, fetches the IP echo URL and gets the exit IP. A domain on the direct list gets the entry IP.
-  - `xray_restart_keeps_settings`: after `docker restart amnezia-xray`, the bind mount is present, `/proc/sys/net/ipv4/ip_local_port_range` excludes `entry_awg_port`, and `ss -ti` on an active connection shows `bbr` (Review Focus 5).
-  - `leak_awg_tcp_sport_443`: from the AWG lab client, `curl --local-port 443 <ip echo>` returns the exit IP, and no packet leaves the entry's public interface from that flow. Check with `fwd_counter` or tcpdump, as the existing checks do.
-  - `fail_closed_reality`: run `verify.yml --tags fail_closed` in `reality` mode; it passes.
-  - `rollback_to_awg`: re-run `entry.yml` and `exit.yml` with `uplink_transport=awg`. `multihop-uplink-xray` and `multihop-exit-xray` are gone, the AWG endpoint is `exit_domain:exit_awg_port`, and `reality_uplink`-equivalent egress still works. Then switch back to `reality` (Review Focus 2).
-  - The existing `swap` check runs in `reality` mode too.
+  - `reality_uplink`:
+    - `multihop-uplink-xray` listens on the TPROXY port;
+    - there is an established TCP connection to the exit's REALITY port;
+    - the AWG lab client's egress = exit IP.
+  - `reality_throughput`: from the AWG lab client, through the whole path, a 20 s download from a fast URL, e.g. `curl -o /dev/null -w '%{speed_download}' https://speed.cloudflare.com/__down?bytes=99000000`. Record the Mbit/s.
+  - `fail_closed_reality_entry_xray`: with `multihop-uplink-xray` stopped, neither the AWG client nor the Xray client reaches the internet. Then start it again.
+  - `fail_closed_reality_exit_xray`: the same with `multihop-exit-xray` stopped on the exit.
+  - `fail_closed_reality_no_tproxy`: run `iptables -t mangle -F MULTIHOP-TPROXY` on the entry; the AWG client has no internet. Then restore it with `systemctl reload multihop-net` (or however the role re-applies the rules).
+  - `icmp_blocked_reality`: `ping -c 3 1.1.1.1` from the AWG client gets no reply.
+  - `direct_and_force_exit_reality`: a direct-list destination leaves via the entry IP; a `split_force_exit_cidrs` destination inside a direct range leaves via the exit.
+  - `xray_client_via_exit`:
+    - add a VLESS client the way the app does: append a client to `server.json`, then `docker restart amnezia-xray`;
+    - a stock Xray client container on `CLIENT_IP`, built from `xray-client.json.j2` with a SOCKS inbound, fetches the IP echo URL and gets the exit IP;
+    - a direct-list domain gets the entry IP.
+  - `xray_restart_keeps_settings`, after `docker restart amnezia-xray` (Review Focus 5):
+    - the bind mount is present;
+    - `/proc/sys/net/ipv4/ip_local_port_range` excludes `entry_awg_port`;
+    - `ss -ti` on an active connection shows `bbr`.
+  - `leak_awg_tcp_sport_443`: from the AWG lab client, `curl --local-port 443 <ip echo>` returns the exit IP, and no packet of that flow leaves the entry's public interface towards the echo host (tcpdump on the entry, as the existing checks do).
+  - `rollback_to_awg`: re-run `entry.yml` with `uplink_transport=awg`.
+    - `multihop-uplink-xray` is gone, `multihop-uplink` is running with endpoint `exit_domain:exit_awg_port`, `MULTIHOP-TPROXY` is absent, and table 51820 has no `local` route.
+    - The AWG client's egress is the exit IP.
+    - Then switch back to `reality` and re-run `reality_uplink` (Review Focus 2).
+  - The existing `swap` check runs in `reality` mode.
 
 - [ ] **Step 1: Implement** the checks and the lab defaults (`uplink_transport: reality`, `entry_xray_enabled: true`).
-- [ ] **Step 2: Run on the lab** (owner-provided hosts in `tests/integration/.state/lab.env`): `tests/integration/run.sh init && tests/integration/run.sh deploy && tests/integration/run.sh check && tests/integration/run.sh swap`. Expected: every check PASS. Logs are in `tests/integration/.state/logs/`.
+- [ ] **Step 2: Run on the lab** (owner-provided hosts in `tests/integration/.state/lab.env`): `tests/integration/run.sh init && tests/integration/run.sh deploy && tests/integration/run.sh check && tests/integration/run.sh swap`. Expected: every check PASS. Logs are in `tests/integration/.state/logs/`. If `.state/lab.env` is missing or its hosts are unreachable, report NEEDS_CONTEXT so the controller can ask the owner for lab hosts.
 - [ ] **Step 3: App adoption check, done by the owner** on the lab entry with the macOS Amnezia app 5.1.0.6:
   1. Add the server by domain and confirm the app shows XRay as installed, not "update" or "reinstall".
   2. Add a user and connect with the exported `vless://` link in a third-party client.
   3. Report how the app treats the container's Xray release (v26.10.31 vs `expectedServerXrayRelease` v26.7.28).
 
-  If it asks for an update or reinstall, change the vendored Dockerfile's `XRAY_RELEASE` to the release it accepts, re-run, and record the outcome in spec section 5.
+  If it asks for an update or reinstall, change the vendored Dockerfile's `XRAY_RELEASE` to the release it accepts, re-run, and record the outcome in design section 5.
 - [ ] **Step 4: Run** `make test lint`. Expected: pass.
-- [ ] **Step 5: Commit** with `git commit -m "test: lab coverage for REALITY uplink and entry Xray"`.
+- [ ] **Step 5: Commit** with `git commit -m "test: lab coverage for the Xray uplink and entry Xray"`.
 
 ### Task 11: Documentation and example inventory
 
@@ -389,13 +477,13 @@
 - Modify: `README.md`, `inventories/example/group_vars/all/vars.yml`, `docs/superpowers/specs/2026-11-03-reality-uplink-and-entry-xray-design.md` (record the Task 1 numbers and the Task 10 app-version result)
 
 - [ ] **Step 1: Update the README.**
-  - The architecture diagram shows both transports.
+  - The architecture diagram shows both transports (`awg` direct; `reality` = TPROXY into Xray, VLESS + REALITY to the exit).
   - New variables table (spec section 9) and updating `xray_image_digest`.
   - `gen-secrets.py xray` for existing vaults.
   - Rule change: the entry runs exactly `amnezia-awg2`, `amnezia-xray`, `multihop-uplink`, `multihop-uplink-xray`.
   - App rules for Xray (spec 8.4): manage only from the 5.1.0.6 desktop app; no port change; no reinstall; site change allowed.
   - Clients (spec 8.5): AWG users change nothing; Xray users need a VLESS client.
-  - Swap behaviour: the old exit is stopped after the DNS flip, and `stop_old=yes` also disables its restart.
+  - Swap behaviour: in awg mode the old exit is stopped after the DNS flip, and `stop_old=yes` also disables its restart. In reality mode the entry restarts its Xray after the flip.
   - The exit's AWG port stays public for fast rollback to `uplink_transport: awg`.
   - Troubleshooting commands for the Xray containers.
   - BBR.
@@ -405,15 +493,14 @@
 
 ### Task 12: Production rollout (operational, owner go-ahead per step)
 
-**Files:** `inventories/prod/group_vars/all/vars.yml` and the vault (gitignored, not committed).
+**Files:** `inventories/prod/group_vars/all/vars.yml` and the vault files (gitignored, not committed).
 
-- [ ] **Step 1: Add the new secrets.**
-  1. `uv run scripts/gen-secrets.py xray > /tmp/x.yml`.
-  2. `uv run ansible-vault edit inventories/prod/group_vars/all/vault.yml` and append both blocks.
-  3. Delete `/tmp/x.yml`.
-  4. Set `uplink_transport: reality`, `xray_image_digest` and `entry_xray_enabled: false` (Part 2 comes later) in prod `vars.yml`.
-- [ ] **Step 2: Exit.** `uv run ansible-playbook -i inventories/prod playbooks/exit.yml`. Expected: `multihop-exit-xray` running and users unaffected (the entry still uses AWG directly).
-- [ ] **Step 3: Entry uplink.** `uv run ansible-playbook -i inventories/prod playbooks/entry.yml`. Expected: a short interruption, then `uv run ansible-playbook -i inventories/prod playbooks/verify.yml -e verify_fail_closed=true` passes.
-- [ ] **Step 4: Measure.** On the entry, `iperf3 -c 172.16.255.1 -P 4 -R -t 30` (with iperf3 temporarily on the exit). Report the number next to the old ~1.5 Mbit/s.
+- [ ] **Step 1: Prepare the secrets and vars.**
+  1. `uv run scripts/gen-secrets.py xray`: add both blocks via `uv run ansible-vault edit inventories/prod/group_vars/all/vault.yml`, without writing the plaintext to disk.
+  2. Regenerate `vault_uplink.yml` encrypted, as `rotate-uplink-key.yml` does: `uv run scripts/gen-secrets.py uplink-key | uv run ansible-vault encrypt --output inventories/prod/group_vars/all/vault_uplink.yml`. Keep a copy of the old file until Step 4 passes.
+  3. In prod `vars.yml`, set `uplink_transport: reality`, `xray_image_digest`, and `entry_xray_enabled: false` (Part 2 comes later).
+- [ ] **Step 2: Exit.** `uv run ansible-playbook -i inventories/prod playbooks/exit.yml`. Users lose internet from here until Step 3 finishes, because the AWG uplink key changed. Expect a few minutes.
+- [ ] **Step 3: Entry.** `uv run ansible-playbook -i inventories/prod playbooks/entry.yml`, then `uv run ansible-playbook -i inventories/prod playbooks/verify.yml -e verify_fail_closed=true`. Expected: pass.
+- [ ] **Step 4: Measure.** The owner runs a speed test on a real device through the AWG profile. Compare it with the old ~1.5 Mbit/s uplink and the ~194 Mbit/s exit limit.
 - [ ] **Step 5: Part 2.** Set `entry_xray_enabled: true` and re-run `entry.yml` and `verify.yml`. The owner adds the XRay protocol in the macOS app 5.1.0.6, creates a test user, and confirms it works.
-- [ ] **Step 6: Report** the outcomes. Remove any temporary iperf3 servers.
+- [ ] **Step 6: Report** the outcomes. Delete the old `vault_uplink.yml` copy and any temporary files.
