@@ -190,11 +190,13 @@
 # Every run, not only after an env change: a run that failed after writing the
 # env drops its pending handler, and the next run would see no change. The
 # awg-mode rules delete the local route that blocks `default dev awg-uplink`,
-# so they must be applied before the containers. `up` is idempotent.
+# so they must be applied before the containers. `up` is idempotent, so the
+# reload is an action, not drift: it never reports changed.
 - name: Apply the uplink mode rules to multihop-net
   ansible.builtin.systemd_service:
     name: multihop-net
     state: reloaded
+  changed_when: false
 
 - name: Run multihop-uplink container
   community.docker.docker_container:

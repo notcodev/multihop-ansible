@@ -304,6 +304,8 @@ def test_entry_uplink_reloads_rules_unconditionally_before_containers():
     assert reload_task["ansible.builtin.systemd_service"] == {
         "name": "multihop-net", "state": "reloaded"}
     assert "when" not in reload_task
+    # an action every run, not drift: entry.yml must stay idempotent
+    assert reload_task["changed_when"] is False
     assert reload_i < names.index("Run multihop-uplink container")
     assert reload_i < names.index("Run multihop-uplink-xray container")
 
