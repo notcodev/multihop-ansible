@@ -253,3 +253,35 @@ def test_public_iface_group_udev_rule_matches_the_mac():
     rules = [line for line in text.splitlines() if line and not line.startswith("#")]
     assert rules == ['ACTION=="add|move", SUBSYSTEM=="net", ATTR{address}=="52:54:00:12:34:56", '
                      'RUN+="/usr/sbin/ip link set dev $name group 51820"']
+
+
+def test_exit_xray_config():
+    import json
+    import yaml
+    fx = yaml.safe_load((RENDER_DIR / "fixture_vars.yml").read_text())
+    text = render("roles/exit/templates/xray-exit.json.j2", "xray-exit.json",
+                  {"exit_reality_port": 443, "ansible_host": "198.51.100.7"})
+    cfg = json.loads(text)
+    (inb,) = cfg["inbounds"]
+    assert inb["port"] == 443 and inb["protocol"] == "vless"
+    assert inb["settings"]["decryption"] == "none"
+    assert inb["settings"]["clients"] == [
+        {"id": fx["vault_uplink_entry"]["reality_uuid"], "flow": "xtls-rprx-vision"}]
+    ss = inb["streamSettings"]
+    # Xray 26 docs name the transport field `method` (default raw).
+    assert ss["method"] == "raw" and ss["security"] == "reality"
+    rs = ss["realitySettings"]
+    assert rs["target"] == "dl.google.com:443"
+    assert rs["serverNames"] == ["dl.google.com"]
+    assert rs["privateKey"] == fx["vault_link_reality"]["private_key"]
+    assert rs["shortIds"] == [fx["vault_link_reality"]["short_id"]]
+    for key in ("limitFallbackUpload", "limitFallbackDownload"):
+        assert rs[key]["afterBytes"] > 0 and rs[key]["bytesPerSec"] > 0
+    (out,) = cfg["outbounds"]
+    assert out["protocol"] == "freedom"
+    assert out["settings"]["finalRules"] == [
+        {"action": "block", "ip": ["169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12",
+                                   "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8",
+                                   "198.51.100.7/32"]},
+        {"action": "allow"}]
+    assert "redirect" not in out["settings"]

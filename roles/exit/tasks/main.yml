@@ -1,4 +1,22 @@
 ---
+- name: Check REALITY vault values
+  when: uplink_transport == 'reality'
+  block:
+    - name: Check vault_link_reality
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_link_reality
+        assert_vault_keys: [private_key, public_key, short_id]
+        assert_vault_hint: uv run scripts/gen-secrets.py xray
+
+    - name: Check vault_uplink_entry reality_uuid
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_uplink_entry
+        assert_vault_keys: [reality_uuid]
+        # Rotating also changes the AWG uplink key: deploy the exit, then the entry.
+        assert_vault_hint: uv run scripts/gen-secrets.py uplink-key > <inventory>/group_vars/all/vault_uplink.yml
+
 # Own marker so the common block in multihop.env survives re-runs.
 - name: Write exit keys to multihop.env
   ansible.builtin.blockinfile:
@@ -76,6 +94,23 @@
     group: root
   notify: Restart multihop-exit
 
+- name: Write xray-exit.json
+  ansible.builtin.template:
+    src: xray-exit.json.j2
+    dest: "{{ exit_state_dir }}/xray-exit.json"
+    mode: "0600"
+    owner: root
+    group: root
+  when: uplink_transport == 'reality'
+  no_log: true
+  notify: Restart multihop-exit-xray
+
+- name: Remove xray-exit.json outside reality mode
+  ansible.builtin.file:
+    path: "{{ exit_state_dir }}/xray-exit.json"
+    state: absent
+  when: uplink_transport != 'reality'
+
 - name: Reload systemd units
   ansible.builtin.systemd_service:
     daemon_reload: true
@@ -107,3 +142,15 @@
     volumes:
       - "{{ exit_state_dir }}/awg-exit.conf:/etc/amnezia/awg-exit.conf:ro"
       - "{{ exit_state_dir }}/exit-start.sh:/opt/multihop/exit-start.sh:ro"
+
+- name: Run multihop-exit-xray container
+  community.docker.docker_container:
+    name: multihop-exit-xray
+    image: "{{ common_xray_image_tag }}"
+    state: "{{ 'started' if uplink_transport == 'reality' else 'absent' }}"
+    restart_policy: always
+    network_mode: host
+    user: "0:0"
+    command: ["run", "-c", "/etc/xray/config.json"]
+    volumes:
+      - "{{ exit_state_dir }}/xray-exit.json:/etc/xray/config.json:ro"

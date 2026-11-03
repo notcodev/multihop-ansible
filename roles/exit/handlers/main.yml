@@ -12,3 +12,8 @@
   community.docker.docker_container:
     name: multihop-exit
     restart: true
+
+- name: Restart multihop-exit-xray
+  community.docker.docker_container:
+    name: multihop-exit-xray
+    restart: true

@@ -1,5 +1,7 @@
 ---
-# exit.yml must also pass `common_input_udp_ports: [exit_awg_port]` to the
-# common role so the exit AWG port is allowed through MULTIHOP-IN.
+# exit.yml passes the exit AWG port (UDP) and, in reality mode, the REALITY
+# port (TCP) to the common role so they are allowed through MULTIHOP-IN.
 exit_image: multihop/awg-base:pinned
 exit_state_dir: /var/lib/multihop/exit
+exit_reality_port: 443
+uplink_reality_site: dl.google.com  # noqa: var-naming[no-role-prefix]

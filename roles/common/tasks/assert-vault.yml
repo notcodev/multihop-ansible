@@ -1,0 +1,16 @@
+---
+# Inputs: assert_vault_var (variable name), assert_vault_keys (required keys),
+# assert_vault_hint (the gen-secrets command that produces them).
+- name: Assert the vault variable is complete
+  ansible.builtin.assert:
+    that:
+      - assert_vault_var in vars
+      - vars[assert_vault_var] is mapping
+      - >-
+        assert_vault_keys
+        | map('extract', vars[assert_vault_var])
+        | select('string') | select | list | length == assert_vault_keys | length
+    fail_msg: >-
+      {{ assert_vault_var }} is missing {{ assert_vault_keys | join(', ') }}:
+      run `{{ assert_vault_hint }}` and add the output to the vault
+    quiet: true

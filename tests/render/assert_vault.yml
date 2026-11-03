@@ -1,0 +1,8 @@
+---
+- name: Exercise common/tasks/assert-vault.yml
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Run the vault assertion
+      ansible.builtin.include_tasks: ../../roles/common/tasks/assert-vault.yml

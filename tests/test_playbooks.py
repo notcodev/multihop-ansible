@@ -276,3 +276,20 @@ def test_common_sets_bbr():
     persist = [t for t in tasks
                if t.get("ansible.builtin.copy", {}).get("dest") == "/etc/modules-load.d/multihop-bbr.conf"]
     assert persist and "tcp_bbr" in persist[0]["ansible.builtin.copy"]["content"]
+
+
+def test_missing_reality_vault_message():
+    base = ["ansible-playbook", "-i", "localhost,", "-e", "ansible_connection=local",
+            str(ROOT / "tests" / "render" / "assert_vault.yml")]
+    args = {"assert_vault_var": "vault_link_reality",
+            "assert_vault_keys": ["private_key", "public_key", "short_id"],
+            "assert_vault_hint": "uv run scripts/gen-secrets.py xray"}
+    proc = subprocess.run([*base, "-e", json.dumps(args)], cwd=ROOT, env=_env(),
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "gen-secrets.py xray" in proc.stdout + proc.stderr
+    full = {**args, "vault_link_reality": {"private_key": "a", "public_key": "b",
+                                           "short_id": "c"}}
+    proc = subprocess.run([*base, "-e", json.dumps(full)], cwd=ROOT, env=_env(),
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
