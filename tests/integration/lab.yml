@@ -3,6 +3,7 @@
 #   --tags pin     exit_domain and entry_domain pinned via the hostsfile DNS backend
 #   --tags tools   tcpdump/conntrack on the hosts the checks inspect
 #   --tags client  test VPN client on lab_client, its peer added on the entry like the app does
+#   --tags xray    stock Xray client on lab_client, its user added on the entry like the app does
 
 - name: Pin the exit domain on the entry (hostsfile DNS backend)
   hosts: exit
@@ -33,9 +34,9 @@
   become: true
   tags: [tools]
   tasks:
-    - name: Install tcpdump and conntrack
+    - name: Install tcpdump, conntrack and curl
       ansible.builtin.apt:
-        name: [tcpdump, conntrack]
+        name: [tcpdump, conntrack, curl]
         update_cache: true
         cache_valid_time: 3600
 
@@ -121,3 +122,80 @@
         IP: "{{ lab_client_ip }}"
       register: lab_peer_add
       changed_when: "'added' in lab_peer_add.stdout"
+
+- name: Stock Xray client (a third-party app using the exported vless:// link)
+  hosts: lab_client
+  become: true
+  tags: [xray]
+  roles:
+    - multihop_defaults  # entry_xray_port
+  tasks:
+    - name: Install docker
+      ansible.builtin.apt:
+        name: [docker.io, python3-docker]
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Pull the Xray image (the pinned release the servers run)
+      community.docker.docker_image:
+        name: "ghcr.io/xtls/xray-core@{{ xray_image_digest }}"
+        source: pull
+
+    - name: Create the client directory
+      ansible.builtin.file:
+        path: /var/lib/multihop-lab/xray-client
+        state: directory
+        mode: "0700"
+
+    - name: Write the client config (SOCKS on 127.0.0.1:1080)
+      ansible.builtin.template:
+        src: templates/xray-client.json.j2
+        dest: /var/lib/multihop-lab/xray-client/config.json
+        mode: "0600"
+
+    # Host network: the SOCKS port is reached from the host (curl --socks5-hostname).
+    - name: Run the client
+      community.docker.docker_container:
+        name: lab-xray-client
+        image: "ghcr.io/xtls/xray-core@{{ xray_image_digest }}"
+        state: started
+        recreate: true
+        restart_policy: unless-stopped
+        network_mode: host
+        user: "0:0"
+        command: ["run", "-c", "/etc/xray/config.json"]
+        volumes:
+          - /var/lib/multihop-lab/xray-client/config.json:/etc/xray/config.json:ro
+          # entry_domain is resolved from the host's pinned /etc/hosts.
+          - /etc/hosts:/etc/hosts:ro
+
+- name: Add the Xray client as a user, the way the Amnezia app does
+  hosts: entry
+  become: true
+  gather_facts: false
+  tags: [xray]
+  tasks:
+    # The app appends {id, flow} to inbounds[0].settings.clients of server.json
+    # (QJsonDocument style: sorted keys, 4-space indent), records the client in
+    # clientsTable and restarts the container.
+    - name: Append the client to server.json and clientsTable, restart amnezia-xray
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          D=/var/lib/multihop/entry-xray
+          if jq -e --arg id "$UUID" '.inbounds[0].settings.clients[] | select(.id == $id)' "$D/server.json" >/dev/null; then
+            echo present; exit 0
+          fi
+          conf=$(jq -S --indent 4 --arg id "$UUID" \
+            '.inbounds[0].settings.clients += [{id: $id, flow: "xtls-rprx-vision"}]' "$D/server.json")
+          printf '%s\n' "$conf" > "$D/server.json"
+          [ -s "$D/clientsTable" ] || echo '[]' > "$D/clientsTable"
+          table=$(jq -c --arg id "$UUID" '. + [{clientId: $id, userData: {clientName: "lab-xray-client", creationDate: "2026-11-04"}}]' "$D/clientsTable")
+          printf '%s\n' "$table" > "$D/clientsTable"
+          docker restart amnezia-xray >/dev/null
+          echo added
+        executable: /bin/bash
+      environment:
+        UUID: "{{ lab_xray_client_uuid }}"
+      register: lab_xray_user_add
+      changed_when: "'added' in lab_xray_user_add.stdout"

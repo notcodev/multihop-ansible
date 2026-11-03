@@ -1,0 +1,34 @@
+---
+# Lab-only: fetch, decrypt and validate the latest entry backup on the controller
+# (the strict checks of tasks/fetch-backup.yml, incl. xray/server.json), then
+# delete the decrypted copy. Used by `run.sh check xray_app_user_backup_valid`.
+- name: Fetch and validate the latest backup
+  hosts: entry
+  gather_facts: false
+  roles:
+    - multihop_defaults
+  tasks:
+    - name: Fetch, decrypt and validate the backup on the controller
+      ansible.builtin.include_tasks: ../../playbooks/tasks/fetch-backup.yml
+
+    - name: Read the server.json that was in the backup
+      ansible.builtin.slurp:
+        src: "{{ entry_restore_xray_dir }}/server.json"
+      register: lab_backup_server_json
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Report whether the app-added client is in the validated backup
+      ansible.builtin.debug:
+        msg: >-
+          backup-valid has_xray={{ entry_restore_has_xray }}
+          lab_client_in_backup={{ lab_xray_client_uuid in (lab_backup_server_json.content | b64decode) }}
+
+    - name: Delete the decrypted backup from the controller
+      ansible.builtin.file:
+        path: "{{ entry_restore_tmpdir }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      when: entry_restore_tmpdir is defined

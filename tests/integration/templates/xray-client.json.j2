@@ -1,0 +1,34 @@
+{#- A stock Xray client of the entry's Xray (what a third-party app would run
+    for the exported vless:// link): SOCKS on localhost, VLESS + REALITY +
+    xtls-rprx-vision to entry_domain:entry_xray_port. The server's REALITY keys
+    are the seeded vault_entry_xray ones. Same config format as the uplink's
+    (roles/entry_uplink/templates/xray-uplink.json.j2). -#}
+{{ {
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 1080,
+    "protocol": "socks",
+    "settings": {"udp": true}
+  }],
+  "outbounds": [{
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": entry_domain,
+        "port": entry_xray_port | int,
+        "users": [{"id": lab_xray_client_uuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
+      }]
+    },
+    "streamSettings": {
+      "method": "raw",
+      "security": "reality",
+      "realitySettings": {
+        "serverName": entry_xray_site | default("www.googletagmanager.com"),
+        "fingerprint": "chrome",
+        "password": vault_entry_xray.public_key,
+        "shortId": vault_entry_xray.short_id
+      }
+    }
+  }]
+} | to_nice_json }}

@@ -5,7 +5,8 @@
 #
 #   run.sh init            generate the lab inventory (inventories/lab, gitignored; vars from lab-vars.yml);
 #                          re-run after creating or changing .state/s3.env
-#   run.sh deploy          exit pin + tools, site.yml, test VPN client
+#   run.sh deploy          exit pin + tools, site.yml, test VPN client (the stock Xray
+#                          client is deployed by the Xray checks that need it)
 #   run.sh check [NAME..]  run checks (default: all, in order), print PASS/FAIL
 #   run.sh swap            exit swap to EXIT2 (run last), then its checks
 #   run.sh swap-entry reachable|unreachable|restore
@@ -231,6 +232,35 @@ cmd_client() {
 
 P() { labvar entry_awg_port; }
 
+invvar() { # invvar <name> [default]: a var of the lab inventory's vars.yml (lab-vars.yml copy)
+  local v
+  v=$(awk -v k="$1:" '$1 == k { print $2 }' "$INV/group_vars/all/vars.yml")
+  echo "${v:-${2:-}}"
+}
+transport() { invvar uplink_transport awg; }
+reality() { [ "$(transport)" = reality ]; }
+RPORT() { invvar exit_reality_port 443; }
+TPORT() { invvar uplink_tproxy_port 12345; }
+
+xcurl() { # the stock Xray client's SOCKS proxy (lab-xray-client on CLIENT_IP)
+  on "$CLIENT_IP" curl -4 -s --max-time 15 --socks5-hostname 127.0.0.1:1080 "$@"
+}
+
+xray_client_up() { # until the stock Xray client reaches the internet via the entry's Xray (deploys it if needed)
+  local _
+  xcurl -o /dev/null https://1.1.1.1 && return 0
+  ap lab-xray tests/integration/lab.yml --tags xray || return 1
+  for _ in $(seq 1 20); do
+    xcurl -o /dev/null https://1.1.1.1 && return 0
+    sleep 3
+  done
+  return 1
+}
+
+uplink_conn() { # established TCP connections of the entry to the exit's REALITY port (<exit ip>)
+  on "$ENTRY_IP" "ss -tnH state established dst $1:$(RPORT) | wc -l"
+}
+
 client() { on "$CLIENT_IP" "docker exec lab-client $(printf '%q ' "$@")"; }
 
 client_curl() { client curl -4 -s --max-time 15 "$@"; }
@@ -243,8 +273,15 @@ wait_client() { # until the client reaches the internet through the entry
   return 1
 }
 
-wait_uplink() { # until awg-uplink has a handshake younger than 180 s
-  local age
+wait_uplink() { # [awg|reality]: until the uplink is up (awg: handshake younger than 180 s; reality: Xray container running)
+  local age mode="${1:-$(transport)}"
+  if [ "$mode" = reality ]; then
+    for _ in $(seq 1 30); do
+      [ "$(on "$ENTRY_IP" 'docker inspect -f "{{.State.Running}}" multihop-uplink-xray' 2>/dev/null)" = true ] && return 0
+      sleep 2
+    done
+    return 1
+  fi
   for _ in $(seq 1 30); do
     age=$(on "$ENTRY_IP" 'echo $(( $(date +%s) - $(docker exec multihop-uplink awg show awg-uplink latest-handshakes | awk "{print \$2}") ))' 2>/dev/null)
     [ -n "$age" ] && [ "$age" -lt 180 ] && return 0
@@ -254,7 +291,11 @@ wait_uplink() { # until awg-uplink has a handshake younger than 180 s
   return 1
 }
 
-exit_bytes() { # total awg-exit transfer on the current exit
+exit_bytes() { # total awg-exit transfer on the current exit (reality: bytes sent on its public interface)
+  if reality; then
+    on "$1" '. /etc/multihop/multihop.env && cat /sys/class/net/$PUBLIC_IFACE/statistics/tx_bytes'
+    return
+  fi
   on "$1" "docker exec multihop-exit awg show awg-exit transfer | awk '{ s += \$2 + \$3 } END { print s + 0 }'"
 }
 
@@ -331,13 +372,18 @@ ck_first_run_reload() { # [log name]: handlers with state: reloaded on a unit no
 
 ck_images_clean() {
   local imgs ps opt ref digest_ref
-  imgs=$(on "$ENTRY_IP" "docker images --format '{{.Repository}}:{{.Tag}}' | grep amnezia" | paste -sd' ' -)
-  ps=$(on "$ENTRY_IP" "docker ps -a --format '{{.Names}} {{.Image}}' | grep amnezia" | paste -sd' ' -)
+  imgs=$(on "$ENTRY_IP" "docker images --format '{{.Repository}}:{{.Tag}}' | grep amnezia | sort" | paste -sd' ' -)
+  ps=$(on "$ENTRY_IP" "docker ps -a --format '{{.Names}} {{.Image}}' | grep amnezia | sort" | paste -sd' ' -)
   opt=$(on "$ENTRY_IP" 'ls -d /opt/amnezia 2>/dev/null')
   # The containerd image store hides digest-only references from `docker images`.
   ref="amneziavpn/amneziawg-go@$(awk '$1 == "awg_base_image_digest:" { print $2 }' "$INV/group_vars/all/vars.yml")"
   digest_ref=$(on "$ENTRY_IP" "docker image inspect -f '{{.Id}}' $ref 2>/dev/null")
-  if [ "$imgs" = "amnezia-awg2:latest" ] && [ "$ps" = "amnezia-awg2 amnezia-awg2" ] && [ -z "$opt" ] \
+  local want_imgs="amnezia-awg2:latest" want_ps="amnezia-awg2 amnezia-awg2"
+  if [ "$(invvar entry_xray_enabled false)" = true ]; then # the app's Xray, built like the AWG one
+    want_imgs="amnezia-awg2:latest amnezia-xray:latest"
+    want_ps="amnezia-awg2 amnezia-awg2 amnezia-xray amnezia-xray"
+  fi
+  if [ "$imgs" = "$want_imgs" ] && [ "$ps" = "$want_ps" ] && [ -z "$opt" ] \
      && [ -z "$digest_ref" ]; then
     result PASS images_clean "images: $imgs; containers: $ps; host /opt/amnezia absent; no $ref reference"
   else
@@ -433,6 +479,9 @@ ck_client_fail_closed() {
   # drops the inbound packets), and nothing to 1.1.1.1 leaves. Packets seen
   # on the bridges and the MULTIHOP-FWD DROP delta are informational.
   local ent in rc eif p d0 d1 r0 r1 b n caps=() brs br=""
+  # awg-uplink specific (stops multihop-uplink, reads the rp_filter counter); the
+  # reality mode has fail_closed_reality_*.
+  reality && { result SKIP client_fail_closed "uplink_transport=reality: see fail_closed_reality_*"; return; }
   eif=$(pubif "$ENTRY_IP"); p=$(P)
   brs=$(on "$ENTRY_IP" '. /etc/multihop/multihop.env && echo "$BRIDGES"')
   on "$ENTRY_IP" docker stop multihop-uplink >/dev/null
@@ -482,6 +531,7 @@ ck_client_private_net() {
 
 ck_idle_reply() { # server-initiated packet after the host conntrack entry expired
   local p ct eth up eif
+  reality && { result SKIP idle_reply "uplink_transport=reality: no awg-uplink interface to compare against"; return; }
   p=$(P); eif=$(pubif "$ENTRY_IP")
   log "idle_reply: keeping the client silent for 135 s"
   sleep 135
@@ -695,9 +745,235 @@ ck_docker_blocked() { # Docker must not start on the entry when the entry rules 
   fi
 }
 
+# ----------------------------------------------------------------------------
+# Xray uplink (uplink_transport: reality) and the app's Xray on the entry
+
+need_reality() { # need_reality <check>: SKIP unless the lab runs the Xray uplink
+  reality && return 0
+  result SKIP "$1" "uplink_transport=$(transport), not reality"
+  return 1
+}
+
+ck_reality_uplink() {
+  need_reality reality_uplink || return
+  local ip lst conn
+  ip=$(client_curl https://api.ipify.org)
+  lst=$(on "$ENTRY_IP" "ss -ltnH 'sport = :$(TPORT)'" | awk '{print $4}' | paste -sd' ' -)
+  conn=$(uplink_conn "$EXIT_NOW")
+  if [ -n "$lst" ] && [ "${conn:-0}" -ge 1 ] 2>/dev/null && [ "$ip" = "$EXIT_NOW" ]; then
+    result PASS reality_uplink "multihop-uplink-xray listens on $lst; $conn established TCP to $EXIT_NOW:$(RPORT); AWG client egress $ip (= exit)"
+  else
+    result FAIL reality_uplink "listen '$lst'; established to $EXIT_NOW:$(RPORT) = '$conn'; AWG client egress '$ip' (exit $EXIT_NOW)"
+  fi
+}
+
+ck_reality_throughput() { # 20 s download from the AWG client through the whole path
+  need_reality reality_throughput || return
+  local bps mbit
+  bps=$(client_curl --max-time 20 -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=99000000')
+  mbit=$(awk -v b="${bps:-0}" 'BEGIN { printf "%.1f", b * 8 / 1000000 }')
+  if awk -v m="$mbit" 'BEGIN { exit !(m > 1) }'; then
+    result PASS reality_throughput "AWG client -> entry -> Xray uplink -> exit -> speed.cloudflare.com: $mbit Mbit/s (20 s max)"
+  else
+    result FAIL reality_throughput "$mbit Mbit/s (speed_download '${bps:-}')"
+  fi
+}
+
+# fail_closed_reality <check> <ip> <container>: stop <container> on <ip>; neither the
+# AWG client nor the Xray client reaches the internet; start it again.
+fail_closed_reality() {
+  local name="$1" host="$2" ctr="$3" pre rc_awg rc_x
+  xray_client_up || { result FAIL "$name" "the Xray client gets no traffic before the test"; return; }
+  pre=$(xcurl https://api.ipify.org)
+  on "$host" "docker stop $ctr >/dev/null"
+  client_curl -o /dev/null --max-time 8 https://1.1.1.1; rc_awg=$?
+  xcurl -o /dev/null --max-time 8 https://1.1.1.1; rc_x=$?
+  on "$host" "docker start $ctr >/dev/null"
+  wait_uplink && wait_client && xray_client_up
+  if [ "$rc_awg" -ne 0 ] && [ "$rc_x" -ne 0 ] && [ "$pre" = "$EXIT_NOW" ]; then
+    result PASS "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x (before: Xray client egress $pre); restored after start"
+  else
+    result FAIL "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x; Xray client egress before '$pre' (exit $EXIT_NOW)"
+  fi
+}
+
+ck_fail_closed_reality_entry_xray() {
+  need_reality fail_closed_reality_entry_xray || return
+  fail_closed_reality fail_closed_reality_entry_xray "$ENTRY_IP" multihop-uplink-xray
+}
+
+ck_fail_closed_reality_exit_xray() {
+  need_reality fail_closed_reality_exit_xray || return
+  fail_closed_reality fail_closed_reality_exit_xray "$EXIT_NOW" multihop-exit-xray
+}
+
+ck_fail_closed_reality_no_tproxy() { # the chain flushed: marked packets go to `local`, nothing leaves
+  need_reality fail_closed_reality_no_tproxy || return
+  local rc eif cap n
+  eif=$(pubif "$ENTRY_IP")
+  capture "$ENTRY_IP" 15 "$eif" 'host 1.1.1.1' > "$STATE/cap-entry" &
+  listening "$STATE/cap-entry"
+  on "$ENTRY_IP" 'iptables -t mangle -F MULTIHOP-TPROXY'
+  client_curl -o /dev/null --max-time 8 https://1.1.1.1; rc=$?
+  wait
+  cap=$(pkts "$STATE/cap-entry")
+  on "$ENTRY_IP" 'systemctl reload multihop-net'
+  n=$(on "$ENTRY_IP" 'iptables -t mangle -S MULTIHOP-TPROXY | grep -c -- "-j TPROXY"')
+  wait_client
+  if [ "$rc" -ne 0 ] && [ "$cap" = 0 ] && [ "${n:-0}" -ge 1 ]; then
+    result PASS fail_closed_reality_no_tproxy "MULTIHOP-TPROXY flushed: AWG client curl rc=$rc, pkts to/from 1.1.1.1 on $eif=0; systemctl reload multihop-net restored $n TPROXY rule(s), client back"
+  else
+    result FAIL fail_closed_reality_no_tproxy "curl rc=$rc; $eif pkts=$cap; TPROXY rules after reload=$n"
+  fi
+}
+
+ck_icmp_blocked_reality() {
+  need_reality icmp_blocked_reality || return
+  local out recv
+  out=$(client ping -c 3 -W 2 1.1.1.1 2>&1)
+  recv=$(grep -oE '[0-9]+ packets received' <<<"$out" | awk '{print $1}')
+  if [ "$recv" = 0 ]; then
+    result PASS icmp_blocked_reality "ping -c 3 1.1.1.1 from the AWG client: 0 packets received"
+  else
+    result FAIL icmp_blocked_reality "received='$recv': $(tr '\n' ' ' <<<"$out" | cut -c1-160)"
+  fi
+}
+
+ck_direct_and_force_exit_reality() { # lab: 1.0.0.0/24 direct; 1.1.1.1/32 forced through the exit inside the direct 1.1.1.0/24
+  need_reality direct_and_force_exit_reality || return
+  local d b a dip fip
+  b=$(fwd_counter direct)
+  dip=$(client_curl https://1.0.0.1/cdn-cgi/trace | awk -F= '$1 == "ip" { print $2 }')
+  a=$(fwd_counter direct)
+  fip=$(client_curl https://1.1.1.1/cdn-cgi/trace | awk -F= '$1 == "ip" { print $2 }')
+  d=$(on "$ENTRY_IP" 'ipset list multihop_force_exit 2>/dev/null | grep -c "^1.1.1.1"')
+  if [ "$dip" = "$ENTRY_IP" ] && [ "$a" -gt "$b" ] && [ "$fip" = "$EXIT_NOW" ] && [ "${d:-0}" -ge 1 ]; then
+    result PASS direct_and_force_exit_reality "direct 1.0.0.1 shows entry IP $dip (direct RETURN pkts $b -> $a); force-exit 1.1.1.1 inside direct 1.1.1.0/24 shows exit IP $fip"
+  else
+    result FAIL direct_and_force_exit_reality "direct 1.0.0.1 '$dip' (entry $ENTRY_IP, pkts $b -> $a); force-exit 1.1.1.1 '$fip' (exit $EXIT_NOW); force set entries=$d"
+  fi
+}
+
+ck_xray_client_via_exit() {
+  local ip dip ok=0 added
+  # Adds the user like the app: server.json append + docker restart amnezia-xray.
+  ap lab-xray tests/integration/lab.yml --tags xray || { result FAIL xray_client_via_exit "lab.yml (xray) failed, see $LOGS/lab-xray.log"; return; }
+  added=$(grep -c 'changed: \[entry1\]' "$LOGS/lab-xray.log")
+  for _ in $(seq 1 20); do
+    xcurl -o /dev/null https://1.1.1.1 && { ok=1; break; }
+    sleep 3
+  done
+  ip=$(xcurl https://api.ipify.org)
+  dip=$(xcurl https://ifconfig.me)
+  local note=""
+  [ "$CLIENT_IP" = "$EXIT_NOW" ] && note=" (client host IS the exit: the IP match alone does not discriminate)"
+  if [ "$ok" = 1 ] && [ "$ip" = "$EXIT_NOW" ] && [ "$dip" = "$ENTRY_IP" ]; then
+    result PASS xray_client_via_exit "stock Xray client (VLESS+REALITY+vision, user added to server.json like the app; entry tasks changed=$added): egress $ip (= exit)$note; direct-list ifconfig.me shows entry IP $dip"
+  else
+    result FAIL xray_client_via_exit "client up=$ok; egress '$ip' (exit $EXIT_NOW); ifconfig.me '$dip' (entry $ENTRY_IP)"
+  fi
+}
+
+ck_xray_restart_keeps_settings() { # Review Focus 5: the settings the app's run script does not give a restarted container
+  [ "$(invvar entry_xray_enabled false)" = true ] || { result SKIP xray_restart_keeps_settings "entry_xray_enabled is not true"; return; }
+  local mount range lo hi cc dl
+  xray_client_up || { result FAIL xray_restart_keeps_settings "the Xray client gets no traffic before the restart"; return; }
+  on "$ENTRY_IP" 'docker restart amnezia-xray >/dev/null'
+  xray_client_up
+  mount=$(on "$ENTRY_IP" "docker inspect -f '{{range .Mounts}}{{.Type}}:{{.Source}}:{{.Destination}} {{end}}' amnezia-xray")
+  range=$(on "$ENTRY_IP" 'docker exec amnezia-xray cat /proc/sys/net/ipv4/ip_local_port_range')
+  read -r lo hi <<<"$range"
+  # An active connection: a download through the Xray client, inspected in the container's netns.
+  xcurl --max-time 12 -o /dev/null 'https://speed.cloudflare.com/__down?bytes=99000000' &
+  dl=$!
+  sleep 5
+  cc=$(on "$ENTRY_IP" 'pid=$(docker inspect -f "{{.State.Pid}}" amnezia-xray); nsenter -t "$pid" -n ss -tin state established | grep -c bbr')
+  kill "$dl" 2>/dev/null; wait "$dl" 2>/dev/null
+  if [[ "$mount" == *"bind:/var/lib/multihop/entry-xray:/opt/amnezia/xray"* ]] \
+     && [ -n "$lo" ] && { [ "$(P)" -lt "$lo" ] || [ "$(P)" -gt "$hi" ]; } && [ "${cc:-0}" -ge 1 ] 2>/dev/null; then
+    result PASS xray_restart_keeps_settings "after docker restart amnezia-xray: mounts '${mount% }'; ip_local_port_range '$lo $hi' excludes entry_awg_port $(P); $cc established connection(s) with bbr"
+  else
+    result FAIL xray_restart_keeps_settings "mounts '$mount'; ip_local_port_range '$range' (entry_awg_port $(P)); bbr connections=$cc"
+  fi
+}
+
+ck_leak_awg_tcp_sport_443() { # a bridge client's TCP source port 443 must not match the Xray reply exception
+  need_reality leak_awg_tcp_sport_443 || return
+  local eif ip cap
+  eif=$(pubif "$ENTRY_IP")
+  # Only a SYN with source port 443 can be a leaked client flow (the entry's own
+  # Xray answers from 443 but never opens a connection from it).
+  capture "$ENTRY_IP" 15 "$eif" 'tcp[tcpflags] == tcp-syn and src port 443' > "$STATE/cap-entry" &
+  listening "$STATE/cap-entry"
+  ip=$(client_curl --local-port 443 https://api.ipify.org)
+  wait
+  cap=$(pkts "$STATE/cap-entry")
+  if [ "$ip" = "$EXIT_NOW" ] && [ "$cap" = 0 ]; then
+    result PASS leak_awg_tcp_sport_443 "AWG client curl --local-port 443: egress $ip (= exit); no outbound SYN with source port 443 on $eif"
+  else
+    result FAIL leak_awg_tcp_sport_443 "egress '$ip' (exit $EXIT_NOW); $eif SYN sport 443 pkts=$cap"
+  fi
+}
+
+ck_rollback_to_awg() { # Review Focus 2: reality -> awg -> reality
+  need_reality rollback_to_awg || return
+  local ctr run ep chain lroutes ip ok=1 why=""
+  if ! ap rollback-awg playbooks/entry.yml -e uplink_transport=awg; then
+    result FAIL rollback_to_awg "entry.yml -e uplink_transport=awg failed, see $LOGS/rollback-awg.log"
+    ap rollback-back playbooks/entry.yml; return
+  fi
+  wait_uplink awg && wait_client
+  ctr=$(on "$ENTRY_IP" 'docker inspect -f "{{.Name}}" multihop-uplink-xray 2>&1' | grep -c 'No such')
+  run=$(on "$ENTRY_IP" 'docker inspect -f "{{.State.Running}}" multihop-uplink')
+  ep=$(on "$ENTRY_IP" 'docker exec multihop-uplink awg show awg-uplink endpoints' | awk '{print $2}')
+  chain=$(on "$ENTRY_IP" 'iptables -t mangle -S MULTIHOP-TPROXY >/dev/null 2>&1; echo $?')
+  lroutes=$(on "$ENTRY_IP" 'ip route show table 51820 | grep -c "^local"')
+  ip=$(client_curl https://api.ipify.org)
+  [ "$ctr" = 1 ] || why="$why multihop-uplink-xray still exists;"
+  [ "$run" = true ] || why="$why multihop-uplink not running;"
+  [ "$ep" = "$EXIT_NOW:$(labvar exit_awg_port)" ] || why="$why endpoint '$ep';"
+  [ "$chain" != 0 ] || why="$why MULTIHOP-TPROXY present;"
+  [ "$lroutes" = 0 ] || why="$why table 51820 has $lroutes local route(s);"
+  [ "$ip" = "$EXIT_NOW" ] || why="$why AWG client egress '$ip';"
+  [ -z "$why" ] || ok=0
+  # Back to reality, as the inventory says.
+  if ! ap rollback-back playbooks/entry.yml; then
+    result FAIL rollback_to_awg "awg phase ok=$ok ($why); entry.yml back to reality failed, see $LOGS/rollback-back.log"; return
+  fi
+  wait_uplink reality && wait_client
+  if [ "$ok" = 1 ]; then
+    result PASS rollback_to_awg "-e uplink_transport=awg: multihop-uplink-xray gone, multihop-uplink running (endpoint $ep), MULTIHOP-TPROXY absent, no local route in table 51820, client egress $ip; then back to reality:"
+  else
+    result FAIL rollback_to_awg "awg phase:$why"
+  fi
+  ck_reality_uplink
+}
+
+ck_xray_app_user_backup_valid() { # a real app-style server.json edit must pass the strict backup validation
+  [ "$(invvar entry_xray_enabled false)" = true ] || { result SKIP xray_app_user_backup_valid "entry_xray_enabled is not true"; return; }
+  s3_ready xray_app_user_backup_valid || return
+  local st out
+  xray_client_up || { result FAIL xray_app_user_backup_valid "the Xray client is not up (user not added)"; return; }
+  on "$ENTRY_IP" systemctl start multihop-backup
+  st=$(on "$ENTRY_IP" systemctl show -P ExecMainStatus multihop-backup)
+  # fetch-backup.yml validates with backup_archive_problems (xray/server.json strict shape).
+  if ! ap backup-valid tests/integration/fetch-check.yml; then
+    result FAIL xray_app_user_backup_valid "backup exit=$st; fetch/validate refused the backup, see $LOGS/backup-valid.log"; return
+  fi
+  out=$(grep -o 'backup-valid has_xray=[A-Za-z]* lab_client_in_backup=[A-Za-z]*' "$LOGS/backup-valid.log" | head -n 1)
+  if [ "$st" = 0 ] && [ "$out" = 'backup-valid has_xray=True lab_client_in_backup=True' ]; then
+    result PASS xray_app_user_backup_valid "app-edited server.json (client added, amnezia-xray restarted) backed up (exit=$st); backup_archive_problems accepted it; $out"
+  else
+    result FAIL xray_app_user_backup_valid "backup exit=$st; '$out'"
+  fi
+}
+
 CHECKS="first_run_reload images_clean to_ports idempotent peer_kept client_via_exit client_direct
 client_udp_sport client_fail_closed client_private_net idle_reply group_heal verify_fail_closed docker_restart reboot
-container_direct client_metadata exit_docker_restart docker_blocked backup drift"
+container_direct client_metadata exit_docker_restart docker_blocked backup drift
+reality_uplink reality_throughput direct_and_force_exit_reality icmp_blocked_reality leak_awg_tcp_sport_443
+xray_client_via_exit xray_restart_keeps_settings xray_app_user_backup_valid
+fail_closed_reality_entry_xray fail_closed_reality_exit_xray fail_closed_reality_no_tproxy rollback_to_awg"
 
 cmd_check() {
   need ENTRY_IP EXIT_IP CLIENT_IP
@@ -726,7 +1002,11 @@ cmd_swap() {
                  /^(ok|changed): \[entry1\]/ || /-> entry1[](]/ { print p }' "$LOGS/swap.log" | sort -u | paste -sd';' -)
     other=$(tr ';' '\n' <<<"$tasks" | grep -vxE "$SWAP_ENTRY_PLAYS")
     pins=$(on "$ENTRY_IP" "grep -F '$(awk '$1 == "exit_domain:" { print $2 }' "$INV/group_vars/all/vars.yml")' /etc/hosts")
-    ep=$(on "$ENTRY_IP" 'docker exec multihop-uplink awg show awg-uplink endpoints' | awk '{print $2}')
+    if reality; then # the entry's Xray talks to the new exit's REALITY port
+      ep=$(on "$ENTRY_IP" "ss -tnH state established dst $EXIT2_IP:$(RPORT)" | awk '{print $4}' | head -n 1)
+    else
+      ep=$(on "$ENTRY_IP" 'docker exec multihop-uplink awg show awg-uplink endpoints' | awk '{print $2}')
+    fi
     if [ "$c" = 0 ] && [ -z "$other" ] && [[ "$ep" == "$EXIT2_IP:"* ]]; then
       result PASS swap_exit "swap-exit.yml ok; entry changed=0; plays touching the entry: $tasks; hosts pin '$pins'; endpoint $ep"
     else
@@ -745,7 +1025,7 @@ cmd_clean() {
   need ENTRY_IP EXIT_IP
   local h
   for h in "$ENTRY_IP" "$EXIT_IP" ${EXIT2_IP:-} ${CLIENT_IP:-}; do
-    on "$h" 'docker rm -f amnezia-awg2 multihop-uplink multihop-exit lab-client 2>/dev/null;
+    on "$h" 'docker rm -f amnezia-awg2 amnezia-xray multihop-uplink multihop-uplink-xray multihop-exit multihop-exit-xray lab-client lab-xray-client 2>/dev/null;
       rm -rf /var/lib/multihop /var/lib/multihop-lab; echo "cleaned $(hostname)"' || true
   done
 }
@@ -755,7 +1035,7 @@ cmd_clean() {
 # runs on EXIT2_IP meanwhile and connects by entry_domain (hostsfile pin).
 
 retire_host() { # retire_host <ip>: remove every multihop role and the lab client from a host
-  on "$1" 'docker rm -f amnezia-awg2 multihop-uplink multihop-exit lab-client >/dev/null 2>&1
+  on "$1" 'docker rm -f amnezia-awg2 amnezia-xray multihop-uplink multihop-uplink-xray multihop-exit multihop-exit-xray lab-client lab-xray-client >/dev/null 2>&1
     systemctl disable --now multihop-backup.timer multihop-reresolve.timer multihop-split-refresh.timer >/dev/null 2>&1
     systemctl stop multihop-net 2>/dev/null
     for s in multihop-exit-net multihop-entry-net; do [ -x /usr/local/sbin/$s ] && /usr/local/sbin/$s down; done

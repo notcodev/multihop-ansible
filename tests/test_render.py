@@ -367,3 +367,20 @@ def test_entry_xray_dockerfile_is_upstream_with_copy():
     upstream = (XRAY_UPSTREAM / "Dockerfile").read_text()
     assert placeholder in upstream
     assert sep + body == upstream.replace(placeholder, "COPY start.sh /opt/amnezia/start.sh\n")
+
+
+def test_lab_xray_client_json_matches_the_entry_xray():
+    cfg = json.loads(render("tests/integration/templates/xray-client.json.j2", "xray-client.json", {
+        "lab_xray_client_uuid": "7c1e0b7e-5b52-4a5b-9d3a-1f2f6a0d9e11",
+        "vault_entry_xray": {"public_key": "PUB", "short_id": "ab12"},
+        "entry_xray_site": "example.org", "entry_xray_port": 8443,
+    }))
+    (inb,) = cfg["inbounds"]
+    assert (inb["protocol"], inb["listen"], inb["port"]) == ("socks", "127.0.0.1", 1080)
+    (out,) = cfg["outbounds"]
+    (vnext,) = out["settings"]["vnext"]
+    assert (vnext["address"], vnext["port"]) == ("entry.example.com", 8443)
+    assert vnext["users"] == [{"id": "7c1e0b7e-5b52-4a5b-9d3a-1f2f6a0d9e11",
+                               "flow": "xtls-rprx-vision", "encryption": "none"}]
+    reality = out["streamSettings"]["realitySettings"]
+    assert (reality["serverName"], reality["password"], reality["shortId"]) == ("example.org", "PUB", "ab12")
