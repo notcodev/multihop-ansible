@@ -279,6 +279,30 @@ def test_common_sets_bbr():
     assert persist and "tcp_bbr" in persist[0]["ansible.builtin.copy"]["content"]
 
 
+def test_entry_uplink_loads_tproxy_modules_before_any_change_in_reality_mode():
+    # A kernel without xt_TPROXY would fail `multihop-entry-net up` only after
+    # the AWG uplink is gone: check (load) it first, and persist it for boot.
+    tasks = yaml.safe_load((ROOT / "roles/entry_uplink/tasks/main.yml").read_text())
+    names = [t.get("name") for t in tasks]
+    first_change = min(names.index("Write uplink keys to multihop.env"),
+                       names.index("Remove multihop-uplink in reality mode"))
+    loads = [(i, t) for i, t in enumerate(tasks) if "community.general.modprobe" in t]
+    loaded = set()
+    for i, t in loads:
+        assert i < first_change, t["name"]
+        assert t["when"] == "uplink_transport == 'reality'"
+        mod = t["community.general.modprobe"]
+        assert mod.get("state") == "present"
+        loaded |= set(t.get("loop") or [mod["name"]])
+    assert {"xt_TPROXY", "nf_tproxy_ipv4"} <= loaded
+    persist = [(i, t) for i, t in enumerate(tasks)
+               if t.get("ansible.builtin.copy", {}).get("dest") == "/etc/modules-load.d/multihop-tproxy.conf"]
+    assert persist
+    i, t = persist[0]
+    assert t["when"] == "uplink_transport == 'reality'"
+    assert t["ansible.builtin.copy"]["content"].split() == ["xt_TPROXY", "nf_tproxy_ipv4"]
+
+
 def test_missing_reality_vault_message():
     base = ["ansible-playbook", "-i", "localhost,", "-e", "ansible_connection=local",
             str(ROOT / "tests" / "render" / "assert_vault.yml")]

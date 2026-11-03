@@ -17,6 +17,27 @@
         # Rotating also changes the AWG uplink key: deploy the exit, then the entry.
         assert_vault_hint: uv run scripts/gen-secrets.py uplink-key > <inventory>/group_vars/all/vault_uplink.yml
 
+# Pre-flight: reality mode needs the TPROXY target. A kernel without it would
+# fail `multihop-entry-net up` only after multihop-uplink is removed, so load
+# it before anything changes (a failure stops the play here) and on boot.
+- name: Load the TPROXY modules (reality mode)
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - xt_TPROXY
+    - nf_tproxy_ipv4
+  when: uplink_transport == 'reality'
+
+- name: Load the TPROXY modules on boot (reality mode)
+  ansible.builtin.copy:
+    content: "xt_TPROXY\nnf_tproxy_ipv4\n"
+    dest: /etc/modules-load.d/multihop-tproxy.conf
+    mode: "0644"
+    owner: root
+    group: root
+  when: uplink_transport == 'reality'
+
 # The bridges' subnets, which multihop-entry-net keeps out of TPROXY in
 # reality mode. entry_app creates the app network after this role on a first
 # deploy, so until then its configured subnet stands in.

@@ -499,6 +499,7 @@ Read all three before starting.
   1. `uv run scripts/gen-secrets.py xray`: add both blocks via `uv run ansible-vault edit inventories/prod/group_vars/all/vault.yml`, without writing the plaintext to disk.
   2. Regenerate `vault_uplink.yml` encrypted, as `rotate-uplink-key.yml` does: `uv run scripts/gen-secrets.py uplink-key | uv run ansible-vault encrypt --output inventories/prod/group_vars/all/vault_uplink.yml`. Keep a copy of the old file until Step 4 passes.
   3. In prod `vars.yml`, set `uplink_transport: reality`, `xray_image_digest`, and `entry_xray_enabled: false` (Part 2 comes later).
+  4. Pre-check the entry kernel: `ssh root@<entry> modprobe xt_TPROXY` must succeed (entry.yml also loads it before any change and stops if it cannot). Do this before Step 2: if it fails, do not switch.
 - [ ] **Step 2: Exit.** `uv run ansible-playbook -i inventories/prod playbooks/exit.yml`. Users lose internet from here until Step 3 finishes, because the AWG uplink key changed. Expect a few minutes.
 - [ ] **Step 3: Entry.** `uv run ansible-playbook -i inventories/prod playbooks/entry.yml`, then `uv run ansible-playbook -i inventories/prod playbooks/verify.yml -e verify_fail_closed=true`. Expected: pass.
 - [ ] **Step 4: Measure.** The owner runs a speed test on a real device through the AWG profile. Compare it with the old ~1.5 Mbit/s uplink and the ~194 Mbit/s exit limit.
