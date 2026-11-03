@@ -57,7 +57,9 @@
 # chain is rebuilt and swapped in atomically (MULTIHOP-TPROXY is complete
 # before MULTIHOP-MARK references it and retired only after no MARK does),
 # and ip rules are swapped through a staging priority so a bridge is never
-# left without a rule into 51820. A bad env fails `up` before any change.
+# left without a rule into 51820. A swap interrupted half-way (a staging
+# chain still live) is completed by the next `up`, never stripped (see
+# resume_chain, install_mark). A bad env fails `up` before any change.
 # Runs before Docker at boot, so it must not depend on Docker's chains.
 set -euo pipefail
 
@@ -117,6 +119,20 @@ drop_chain() {
   fi
 }
 
+chain_exists() { iptables -t "$1" -S "$2" >/dev/null 2>&1; }
+
+# resume_chain <table> <chain>: a run interrupted between retiring <chain>
+# and renaming <chain>-NEW left only the staging chain, which is complete
+# (jumps to it are added only after it is populated) and may be the parent's
+# only jump: finish that rename instead of dropping it. An unreferenced
+# partial one (interrupted while populating) is renamed too and then replaced
+# like any old chain.
+resume_chain() {
+  if ! chain_exists "$1" "$2" && chain_exists "$1" "$2-NEW"; then
+    iptables -t "$1" -E "$2-NEW" "$2"
+  fi
+}
+
 # install_chain <table> <parent> <chain> [jump-match...] < rules
 # Rules (iptables arguments, one per line) come from stdin. The new chain is
 # fully populated and jumped to (once per match; no match = unconditional)
@@ -125,6 +141,7 @@ install_chain() {
   local t="$1" parent="$2" c="$3" new="$3-NEW" rule m
   shift 3
   [ "$#" -gt 0 ] || set -- ""
+  resume_chain "$t" "$c"
   drop_chain "$t" "$parent" "$new"
   iptables -t "$t" -N "$new"
   while read -r rule; do
@@ -228,12 +245,25 @@ tproxy_rules() {
 # the old TPROXY (referenced only by the old, now retired MARK) is dropped
 # and the staging chain renamed (references follow the rename). In awg mode
 # MARK without the jumps goes in first, then TPROXY is dropped.
-# A run interrupted between the MARK swap and the rename leaves MARK jumping
-# to the staging chain; the next run drops it first (bridge traffic then
-# meets the `local` route without TPROXY: fail-closed) and converges.
+# An interrupted run is completed first, never undone, so the live MARK
+# keeps its force_exit jump ahead of the direct mark throughout: MARK absent
+# with MARK-NEW present -> rename (resume_chain); MARK jumping to the staging
+# TPROXY (interrupted after the MARK swap) -> drop the old, unreferenced
+# TPROXY and rename the staging one, which is complete (MARK-NEW references
+# it only once it is built). Then the normal swap runs.
 install_mark() {
+  resume_chain mangle MULTIHOP-MARK
   if [ "$UPLINK_TRANSPORT" = reality ]; then
     local new="$TPROXY_CHAIN-NEW" rule
+    if iptables -t mangle -S MULTIHOP-MARK 2>/dev/null | grep -q -e " -j $new\$"; then
+      if chain_exists mangle "$TPROXY_CHAIN"; then
+        ! iptables -t mangle -S 2>/dev/null | grep -q -e " -j $TPROXY_CHAIN\$" \
+          || die "both $TPROXY_CHAIN and $new are referenced; fix by hand (iptables -t mangle -S)"
+        iptables -t mangle -F "$TPROXY_CHAIN"
+        iptables -t mangle -X "$TPROXY_CHAIN"
+      fi
+      iptables -t mangle -E "$new" "$TPROXY_CHAIN"
+    fi
     # a leftover staging MARK may reference the staging TPROXY
     drop_chain mangle PREROUTING MULTIHOP-MARK-NEW
     drop_chain mangle MULTIHOP-MARK "$new"

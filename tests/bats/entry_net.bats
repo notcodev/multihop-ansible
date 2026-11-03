@@ -34,7 +34,9 @@ case "$op" in
       ! cat "$d/$t".* | grep -q -E -e "(^| )-j $1\$" || exit 1; rm "$(f "$1")" ;;
   -E) [ -f "$(f "$1")" ] || exit 1; mv "$(f "$1")" "$(f "$2")"
       for x in "$d/$t".*; do sed -E "s/(^| )-j $1\$/\1-j $2/" "$x" > "$x.t"; mv "$x.t" "$x"; done ;;
-  -S) [ -f "$(f "$1")" ] || exit 1; echo "-N $1"; sed "s/^/-A $1 /" "$(f "$1")" ;;
+  -S) if [ "$#" -eq 0 ]; then  # whole table
+        for x in "$d/$t".*; do c="${x##*/$t.}"; echo "-N $c"; sed "s/^/-A $c /" "$x"; done
+      else [ -f "$(f "$1")" ] || exit 1; echo "-N $1"; sed "s/^/-A $1 /" "$(f "$1")"; fi ;;
   -A|-I) c="$1"; shift; [ -f "$(f "$c")" ] || exit 1
       # like iptables, a jump to a user chain needs that chain to exist
       r="$*"; case " $r " in *" -j MULTIHOP-"*) j="${r##*-j }"; [ -f "$(f "${j%% *}")" ] || exit 1 ;; esac
@@ -66,14 +68,34 @@ if [ "$t" = filter ] && [ -f "$IPT_GUARD" ]; then
   fi
 fi
 # Guard: every MULTIHOP-TPROXY* chain that a chain jumped to from PREROUTING
-# references exists and ends in DROP (never an empty or half-built chain).
+# references exists and ends in DROP (never an empty or half-built chain), and
+# such a chain that direct-marks has the force_exit rule (RETURN in awg mode,
+# a jump to MULTIHOP-TPROXY* in reality mode) ahead of the direct mark, so a
+# force_exit address in the direct set is never let out the public interface.
+# Once every listed bridge has a PREROUTING jump into MULTIHOP-MARK*, a
+# -D/-F/-X/-E must leave each with one (no window without reply/direct marks).
 if [ "$t" = mangle ] && [ -f "$IPT_GUARD" ]; then
   for c in $(sed -n 's/.*-j \(MULTIHOP-[A-Z-]*\)$/\1/p' "$d/mangle.PREROUTING"); do
     for j in $(sed -n 's/.*-j \(MULTIHOP-TPROXY[A-Z-]*\)$/\1/p' "$d/mangle.$c" 2>/dev/null); do
       [ "$(tail -n1 "$d/mangle.$j" 2>/dev/null)" = "-j DROP" ] \
         || echo "iptables -t mangle $op $* left $c jumping to an incomplete $j" >> "$IPT_GUARD.violations"
     done
+    dm=$(grep -n -m1 -e '--match-set multihop_direct dst -j MARK' "$d/mangle.$c" 2>/dev/null | cut -d: -f1)
+    fe=$(grep -n -m1 -E -e '--match-set multihop_force_exit dst -j (RETURN|MULTIHOP-TPROXY[A-Z-]*)$' "$d/mangle.$c" 2>/dev/null | cut -d: -f1)
+    if [ -n "$dm" ] && { [ -z "$fe" ] || [ "$fe" -gt "$dm" ]; }; then
+      echo "iptables -t mangle $op $* left $c (from PREROUTING) direct-marking without force_exit first" >> "$IPT_GUARD.violations"
+    fi
   done
+  all=1
+  for br in $(cat "$IPT_GUARD"); do
+    grep -qE -e "^-i $br -j MULTIHOP-MARK(-NEW)?\$" "$d/mangle.PREROUTING" || all=
+  done
+  if [ -n "$all" ]; then : > "$IPT_GUARD.mark-armed"
+  elif [ -f "$IPT_GUARD.mark-armed" ]; then
+    case "$op" in -D|-F|-X|-E)
+      echo "iptables -t mangle $op $* left a bridge without a PREROUTING jump into MULTIHOP-MARK" >> "$IPT_GUARD.violations"
+    esac
+  fi
 fi
 exit $rc
 STUB
@@ -575,6 +597,98 @@ R
   ren=$(first_line '^iptables -t mangle -E MULTIHOP-TPROXY-NEW MULTIHOP-TPROXY$')
   [ -n "$swap" ] && [ -n "$old" ] && [ -n "$ren" ]
   [ "$swap" -lt "$old" ] && [ "$old" -lt "$ren" ]
+}
+
+# --- an `up` interrupted mid-swap (seeded state) is completed, not undone.
+# seed_mark_chain <file> <tproxy chain>: the reality MARK layout jumping to it.
+seed_mark_chain() {
+  expected_reality_mark | sed -E "s/-j MULTIHOP-TPROXY$/-j $2/" > "$1"
+}
+
+# The old TPROXY chain (another port) and the new one, complete.
+seed_tproxy_chains() {
+  expected_tproxy | sed 's/12345/11111/' > "$IPT_DIR/mangle.MULTIHOP-TPROXY"
+  expected_tproxy > "$IPT_DIR/mangle.MULTIHOP-TPROXY-NEW"
+}
+
+seed_prerouting() { # seed_prerouting <chain>
+  printf -- '-i docker0 -j %s\n-i amn0 -j %s\n' "$1" "$1" > "$IPT_DIR/mangle.PREROUTING"
+}
+
+@test "reality: up after one interrupted between the MARK retire and rename completes the swap" {
+  reality_env
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  # interrupted in install_chain after the old MARK was dropped: PREROUTING
+  # jumps to MARK-NEW only, which jumps to the (complete) TPROXY-NEW
+  rm "$IPT_DIR/mangle.MULTIHOP-MARK"
+  seed_tproxy_chains
+  seed_mark_chain "$IPT_DIR/mangle.MULTIHOP-MARK-NEW" MULTIHOP-TPROXY-NEW
+  seed_prerouting MULTIHOP-MARK-NEW
+  guard_on; echo "docker0 amn0" > "$IP_DIR/guard"
+  : > "$STUB_LOG"
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  assert_reality_state
+  # the staged chains were renamed, not dropped from PREROUTING
+  ren=$(first_line '^iptables -t mangle -E MULTIHOP-MARK-NEW MULTIHOP-MARK$')
+  [ -n "$ren" ] && [ "$ren" -lt "$(first_line '^iptables -t mangle -D PREROUTING')" ]
+}
+
+@test "reality: up after one interrupted between the MARK swap and the TPROXY rename completes it" {
+  local gone
+  for gone in keep drop; do
+    reality_env
+    rm -f "$IPT_DIR"/* "$IP_DIR"/* "$IPT_GUARD".*
+    touch "$IPT_DIR/filter.FORWARD" "$IPT_DIR/nat.POSTROUTING" \
+          "$IPT_DIR/mangle.FORWARD" "$IPT_DIR/mangle.PREROUTING"
+    run_script multihop-entry-net up
+    [ "$status" -eq 0 ]
+    # the new MARK is live and jumps to TPROXY-NEW; the old TPROXY is
+    # unreferenced (kept, or already dropped)
+    seed_tproxy_chains
+    [ "$gone" = keep ] || rm "$IPT_DIR/mangle.MULTIHOP-TPROXY"
+    seed_mark_chain "$IPT_DIR/mangle.MULTIHOP-MARK" MULTIHOP-TPROXY-NEW
+    seed_prerouting MULTIHOP-MARK
+    guard_on; echo "docker0 amn0" > "$IP_DIR/guard"
+    : > "$STUB_LOG"
+    run_script multihop-entry-net up
+    echo "old TPROXY $gone: $output"
+    [ "$status" -eq 0 ]
+    no_violations
+    assert_reality_state
+    ! grep -q -e '11111' "$IPT_DIR/mangle.MULTIHOP-TPROXY" || false
+    # the live MARK's jumps to TPROXY-NEW were never stripped
+    ! grep -q -e '^iptables -t mangle -D MULTIHOP-MARK ' "$STUB_LOG" || false
+  done
+}
+
+@test "awg: up after one interrupted between the MARK retire and rename completes the swap" {
+  awg_xray_env
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  mv "$IPT_DIR/mangle.MULTIHOP-MARK" "$IPT_DIR/mangle.MULTIHOP-MARK-NEW"
+  seed_prerouting MULTIHOP-MARK-NEW
+  guard_on; echo "docker0 amn0" > "$IP_DIR/guard"
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  assert_awg_state
+  diff "$IPT_DIR/mangle.MULTIHOP-MARK" <(expected_awg_xray_mark)
+}
+
+@test "up after one interrupted between the MULTIHOP-FWD retire and rename keeps the backstop" {
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  mv "$IPT_DIR/filter.MULTIHOP-FWD" "$IPT_DIR/filter.MULTIHOP-FWD-NEW"
+  echo "-j MULTIHOP-FWD-NEW" > "$IPT_DIR/filter.DOCKER-USER"
+  guard_on; echo "docker0 amn0" > "$IP_DIR/guard"
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  no_violations
+  diff "$IPT_DIR/filter.MULTIHOP-FWD" <(expected_fwd)
+  [ "$(cat "$IPT_DIR/filter.DOCKER-USER")" = "-j MULTIHOP-FWD" ]
 }
 
 @test "awg: no local route, no MULTIHOP-TPROXY, MULTIHOP-MARK as today plus xray reply rules when ENTRY_XRAY_PORT set" {
