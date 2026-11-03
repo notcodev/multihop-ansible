@@ -13,7 +13,7 @@
     "settings": {
       "vnext": [{
         "address": exit_domain,
-        "port": exit_reality_port | default(443) | int,
+        "port": exit_reality_port | int,
         "users": [{"id": vault_uplink_entry.reality_uuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
       }]
     },

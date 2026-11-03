@@ -109,4 +109,3 @@ vault_entry_xray:
   private_key: FIXTURE-entry-xray-private-key-00000000
   public_key: FIXTURE-entry-xray-public-key-000000000
   short_id: fedcba9876543210
-uplink_reality_site: dl.google.com

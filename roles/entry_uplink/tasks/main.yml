@@ -58,7 +58,6 @@
       ENTRY_LOCAL_NETS="{{ entry_uplink_local_nets | join(' ') }}"
       ENTRY_XRAY_PORT={{ entry_xray_port if entry_xray_enabled | bool else '' }}
       UPLINK_STATE_DIR={{ entry_uplink_state_dir }}
-  register: entry_uplink_env
   notify: Reload multihop-net
 
 - name: Install multihop scripts
@@ -188,14 +187,14 @@
     enabled: true
     state: started
 
-# A mode switch must apply its rules before the uplink container starts: the
-# awg-mode rules delete the local route that blocks `default dev awg-uplink`.
-# The handler would only reload after the containers.
-- name: Apply changed uplink mode to multihop-net now
+# Every run, not only after an env change: a run that failed after writing the
+# env drops its pending handler, and the next run would see no change. The
+# awg-mode rules delete the local route that blocks `default dev awg-uplink`,
+# so they must be applied before the containers. `up` is idempotent.
+- name: Apply the uplink mode rules to multihop-net
   ansible.builtin.systemd_service:
     name: multihop-net
     state: reloaded
-  when: entry_uplink_env.changed  # noqa: no-handler
 
 - name: Run multihop-uplink container
   community.docker.docker_container:

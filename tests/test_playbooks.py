@@ -293,3 +293,15 @@ def test_missing_reality_vault_message():
     proc = subprocess.run([*base, "-e", json.dumps(full)], cwd=ROOT, env=_env(),
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_entry_uplink_reloads_rules_unconditionally_before_containers():
+    tasks = yaml.safe_load((ROOT / "roles/entry_uplink/tasks/main.yml").read_text())
+    names = [t["name"] for t in tasks]
+    reload_i = names.index("Apply the uplink mode rules to multihop-net")
+    reload_task = tasks[reload_i]
+    assert reload_task["ansible.builtin.systemd_service"] == {
+        "name": "multihop-net", "state": "reloaded"}
+    assert "when" not in reload_task
+    assert reload_i < names.index("Run multihop-uplink container")
+    assert reload_i < names.index("Run multihop-uplink-xray container")

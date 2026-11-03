@@ -260,7 +260,7 @@ def test_exit_xray_config():
     import yaml
     fx = yaml.safe_load((RENDER_DIR / "fixture_vars.yml").read_text())
     text = render("roles/exit/templates/xray-exit.json.j2", "xray-exit.json",
-                  {"exit_reality_port": 443, "ansible_host": "198.51.100.7"})
+                  {"ansible_host": "198.51.100.7"})
     cfg = json.loads(text)
     (inb,) = cfg["inbounds"]
     assert inb["port"] == 443 and inb["protocol"] == "vless"
