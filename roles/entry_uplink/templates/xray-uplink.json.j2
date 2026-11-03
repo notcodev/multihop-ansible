@@ -1,0 +1,31 @@
+{{ {
+  "log": {"loglevel": "warning"},
+  "policy": {"levels": {"0": {"connIdle": 300}}},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": uplink_tproxy_port | int,
+    "protocol": "tunnel",
+    "settings": {"allowedNetwork": "tcp,udp", "followRedirect": true},
+    "streamSettings": {"sockopt": {"tproxy": "tproxy"}}
+  }],
+  "outbounds": [{
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": exit_domain,
+        "port": exit_reality_port | default(443) | int,
+        "users": [{"id": vault_uplink_entry.reality_uuid, "flow": "xtls-rprx-vision", "encryption": "none"}]
+      }]
+    },
+    "streamSettings": {
+      "method": "raw",
+      "security": "reality",
+      "realitySettings": {
+        "serverName": uplink_reality_site,
+        "fingerprint": "chrome",
+        "password": vault_link_reality.public_key,
+        "shortId": vault_link_reality.short_id
+      }
+    }
+  }]
+} | to_nice_json }}

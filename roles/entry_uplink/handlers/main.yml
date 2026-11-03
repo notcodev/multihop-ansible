@@ -12,3 +12,9 @@
   community.docker.docker_container:
     name: multihop-uplink
     restart: true
+  when: uplink_transport != 'reality'
+
+- name: Restart multihop-uplink-xray
+  community.docker.docker_container:
+    name: multihop-uplink-xray
+    restart: true

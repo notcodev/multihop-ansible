@@ -112,3 +112,62 @@ A
   grep -qF "cannot set the group of eth9" <<<"$output"
   grep -qxF -e "docker exec multihop-uplink awg set awg-uplink peer $PUB endpoint 203.0.113.9:27887" "$STUB_LOG"
 }
+
+# --- reality mode: the uplink is the entry's Xray container ---------------
+
+reality_setup() {
+  export STATE="$BATS_TEST_TMPDIR/state"
+  mkdir -p "$STATE"
+  cat >> "$MULTIHOP_ENV" <<ENV
+UPLINK_TRANSPORT=reality
+UPLINK_STATE_DIR=$STATE
+ENV
+}
+
+@test "reality mode restarts uplink xray when the exit IP changes" {
+  reality_setup
+  echo 203.0.113.8 > "$STATE/exit-ip"
+  stub getent "203.0.113.9     STREAM exit.example.com"
+  run_script multihop-reresolve
+  [ "$status" -eq 0 ]
+  grep -qxF -e 'docker restart multihop-uplink-xray' "$STUB_LOG"
+  ! grep -q -e 'awg' "$STUB_LOG" || false
+  [ "$(cat "$STATE/exit-ip")" = "203.0.113.9" ]
+}
+
+@test "reality mode first run records the IP without a restart" {
+  reality_setup
+  stub getent "203.0.113.9     STREAM exit.example.com"
+  run_script multihop-reresolve
+  [ "$status" -eq 0 ]
+  [ "$(cat "$STATE/exit-ip")" = "203.0.113.9" ]
+  ! grep -q -e '^docker' "$STUB_LOG" || false
+}
+
+@test "reality mode does nothing when the IP is unchanged" {
+  reality_setup
+  echo 203.0.113.9 > "$STATE/exit-ip"
+  stub getent "203.0.113.9     STREAM exit.example.com"
+  run_script multihop-reresolve
+  [ "$status" -eq 0 ]
+  ! grep -q -e '^docker' "$STUB_LOG" || false
+  [ "$(cat "$STATE/exit-ip")" = "203.0.113.9" ]
+}
+
+@test "reality mode keeps everything on a failed resolve" {
+  reality_setup
+  echo 203.0.113.8 > "$STATE/exit-ip"
+  stub getent "" 2
+  run_script multihop-reresolve
+  [ "$status" -eq 0 ]
+  ! grep -q -e '^docker' "$STUB_LOG" || false
+  [ "$(cat "$STATE/exit-ip")" = "203.0.113.8" ]
+}
+
+@test "reality mode does not need the AWG keys" {
+  reality_setup
+  sed -i.bak '/^EXIT_PORT=/d;/^EXIT_PUBKEY=/d' "$MULTIHOP_ENV"
+  stub getent "203.0.113.9     STREAM exit.example.com"
+  run_script multihop-reresolve
+  [ "$status" -eq 0 ]
+}

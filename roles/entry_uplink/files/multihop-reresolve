@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Re-resolve EXIT_DOMAIN and repoint the uplink peer when the address changed.
-# A failed, empty or malformed resolution never touches the current endpoint.
+# Re-resolve EXIT_DOMAIN when the address changed: repoint the AWG uplink peer,
+# or in reality mode restart the uplink Xray (it resolves the domain only at
+# start). A failed, empty or malformed resolution never touches anything.
 set -euo pipefail
 
 MULTIHOP_ENV="${MULTIHOP_ENV:-/etc/multihop/multihop.env}"
@@ -8,8 +9,11 @@ MULTIHOP_ENV="${MULTIHOP_ENV:-/etc/multihop/multihop.env}"
 . "$MULTIHOP_ENV"
 
 : "${EXIT_DOMAIN:?EXIT_DOMAIN not set in $MULTIHOP_ENV}"
-: "${EXIT_PORT:?EXIT_PORT not set in $MULTIHOP_ENV}"
-: "${EXIT_PUBKEY:?EXIT_PUBKEY not set in $MULTIHOP_ENV}"
+UPLINK_TRANSPORT="${UPLINK_TRANSPORT:-awg}"
+if [ "$UPLINK_TRANSPORT" != reality ]; then
+  : "${EXIT_PORT:?EXIT_PORT not set in $MULTIHOP_ENV}"
+  : "${EXIT_PUBKEY:?EXIT_PUBKEY not set in $MULTIHOP_ENV}"
+fi
 CONTAINER=multihop-uplink
 IFACE=awg-uplink
 
@@ -27,6 +31,23 @@ if ! [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   log "cannot resolve $EXIT_DOMAIN (got '${addr}'), keeping current endpoint"
   exit 0
 fi
+
+if [ "$UPLINK_TRANSPORT" = reality ]; then
+  : "${UPLINK_STATE_DIR:?UPLINK_STATE_DIR not set in $MULTIHOP_ENV}"
+  state="$UPLINK_STATE_DIR/exit-ip"
+  old=""
+  [ -r "$state" ] && old=$(cat "$state")
+  [ "$old" = "$addr" ] && exit 0
+  # First run only records the address: the container just started with it.
+  if [ -n "$old" ]; then
+    log "exit address $old -> $addr, restarting multihop-uplink-xray"
+    docker restart multihop-uplink-xray >/dev/null
+  fi
+  # Written after a successful restart, so a failed one is retried next run.
+  echo "$addr" > "$state"
+  exit 0
+fi
+
 want="$addr:$EXIT_PORT"
 
 peers=$(docker exec "$CONTAINER" awg show "$IFACE" endpoints)

@@ -285,3 +285,35 @@ def test_exit_xray_config():
                                    "198.51.100.7/32"]},
         {"action": "allow"}]
     assert "redirect" not in out["settings"]
+
+
+def test_uplink_xray_config():
+    import json
+    import yaml
+    fx = yaml.safe_load((RENDER_DIR / "fixture_vars.yml").read_text())
+    text = render("roles/entry_uplink/templates/xray-uplink.json.j2", "xray-uplink.json",
+                  {"uplink_tproxy_port": 12345})
+    cfg = json.loads(text)
+    (inb,) = cfg["inbounds"]
+    assert inb["listen"] == "127.0.0.1" and inb["port"] == 12345
+    assert inb["protocol"] == "tunnel"
+    # Xray 26 docs name the tunnel's network list `allowedNetwork`.
+    assert inb["settings"]["allowedNetwork"] == "tcp,udp"
+    assert inb["settings"]["followRedirect"] is True
+    assert inb["streamSettings"]["sockopt"]["tproxy"] == "tproxy"
+    assert "sniffing" not in inb or inb["sniffing"]["enabled"] is False
+    (out,) = cfg["outbounds"]
+    assert out["protocol"] == "vless"
+    (vnext,) = out["settings"]["vnext"]
+    assert vnext["address"] == fx["exit_domain"] and vnext["port"] == 443
+    (user,) = vnext["users"]
+    assert user == {"id": fx["vault_uplink_entry"]["reality_uuid"],
+                    "flow": "xtls-rprx-vision", "encryption": "none"}
+    ss = out["streamSettings"]
+    assert ss["method"] == "raw" and ss["security"] == "reality"
+    assert ss["realitySettings"] == {
+        "serverName": "dl.google.com", "fingerprint": "chrome",
+        "password": fx["vault_link_reality"]["public_key"],
+        "shortId": fx["vault_link_reality"]["short_id"]}
+    assert not [o for o in cfg["outbounds"] if o["protocol"] in ("freedom", "blackhole")]
+    assert cfg["policy"]["levels"]["0"]["connIdle"] >= 300

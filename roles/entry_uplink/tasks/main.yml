@@ -1,4 +1,22 @@
 ---
+- name: Check REALITY vault values
+  when: uplink_transport == 'reality'
+  block:
+    - name: Check vault_link_reality
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_link_reality
+        assert_vault_keys: [private_key, public_key, short_id]
+        assert_vault_hint: uv run scripts/gen-secrets.py xray
+
+    - name: Check vault_uplink_entry reality_uuid
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_uplink_entry
+        assert_vault_keys: [reality_uuid]
+        # Rotating also changes the AWG uplink key: deploy the exit, then the entry.
+        assert_vault_hint: uv run scripts/gen-secrets.py uplink-key > <inventory>/group_vars/all/vault_uplink.yml
+
 # The bridges' subnets, which multihop-entry-net keeps out of TPROXY in
 # reality mode. entry_app creates the app network after this role on a first
 # deploy, so until then its configured subnet stands in.
@@ -39,6 +57,8 @@
       UPLINK_TPROXY_PORT={{ uplink_tproxy_port }}
       ENTRY_LOCAL_NETS="{{ entry_uplink_local_nets | join(' ') }}"
       ENTRY_XRAY_PORT={{ entry_xray_port if entry_xray_enabled | bool else '' }}
+      UPLINK_STATE_DIR={{ entry_uplink_state_dir }}
+  register: entry_uplink_env
   notify: Reload multihop-net
 
 - name: Install multihop scripts
@@ -121,6 +141,23 @@
   no_log: true
   notify: Restart multihop-uplink
 
+- name: Write xray-uplink.json
+  ansible.builtin.template:
+    src: xray-uplink.json.j2
+    dest: "{{ entry_uplink_state_dir }}/xray-uplink.json"
+    mode: "0600"
+    owner: root
+    group: root
+  when: uplink_transport == 'reality'
+  no_log: true
+  notify: Restart multihop-uplink-xray
+
+- name: Remove xray-uplink.json outside reality mode
+  ansible.builtin.file:
+    path: "{{ entry_uplink_state_dir }}/xray-uplink.json"
+    state: absent
+  when: uplink_transport != 'reality'
+
 - name: Write uplink-start.sh
   ansible.builtin.template:
     src: uplink-start.sh.j2
@@ -134,6 +171,15 @@
   ansible.builtin.systemd_service:
     daemon_reload: true
 
+# In reality mode the AWG uplink goes first: its `default dev awg-uplink` and
+# the `local default dev lo` of table 51820 share one route key, so it must be
+# gone before multihop-net installs the reality rules.
+- name: Remove multihop-uplink in reality mode
+  community.docker.docker_container:
+    name: multihop-uplink
+    state: absent
+  when: uplink_transport == 'reality'
+
 # Rules first, then the container that adds the uplink route. Handlers
 # (container restart included) run at the end of the play.
 - name: Enable and start multihop-net
@@ -141,6 +187,15 @@
     name: multihop-net
     enabled: true
     state: started
+
+# A mode switch must apply its rules before the uplink container starts: the
+# awg-mode rules delete the local route that blocks `default dev awg-uplink`.
+# The handler would only reload after the containers.
+- name: Apply changed uplink mode to multihop-net now
+  ansible.builtin.systemd_service:
+    name: multihop-net
+    state: reloaded
+  when: entry_uplink_env.changed  # noqa: no-handler
 
 - name: Run multihop-uplink container
   community.docker.docker_container:
@@ -161,6 +216,21 @@
     volumes:
       - "{{ entry_uplink_state_dir }}/awg-uplink.conf:/etc/amnezia/awg-uplink.conf:ro"
       - "{{ entry_uplink_state_dir }}/uplink-start.sh:/opt/multihop/uplink-start.sh:ro"
+  when: uplink_transport != 'reality'
+
+- name: Run multihop-uplink-xray container
+  community.docker.docker_container:
+    name: multihop-uplink-xray
+    image: "{{ common_xray_image_tag }}"
+    state: "{{ 'started' if uplink_transport == 'reality' else 'absent' }}"
+    restart_policy: always
+    network_mode: host
+    user: "0:0"
+    capabilities:
+      - NET_ADMIN
+    command: ["run", "-c", "/etc/xray/config.json"]
+    volumes:
+      - "{{ entry_uplink_state_dir }}/xray-uplink.json:/etc/xray/config.json:ro"
 
 - name: Enable and start re-resolve timer
   ansible.builtin.systemd_service:
