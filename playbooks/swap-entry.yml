@@ -128,10 +128,15 @@
   become: true
   vars:
     _old_entry_reachable: "{{ hostvars[groups['entry_old'][0]]['old_entry_reachable'] | bool }}"
-  tasks:
-    - name: Apply exit
-      ansible.builtin.include_role:
-        name: exit
+  # The same roles as playbooks/exit.yml (common supplies the defaults the exit
+  # role needs and keeps the exit's AWG/REALITY ports open).
+  roles:
+    - role: common
+      vars:
+        common_input_udp_ports: ["{{ exit_awg_port }}"]
+        common_input_tcp_ports: "{{ [exit_reality_port] if uplink_transport == 'reality' else [] }}"
+      when: not _old_entry_reachable
+    - role: exit
       when: not _old_entry_reachable
 
 - name: Deploy the new entry and restore the backup

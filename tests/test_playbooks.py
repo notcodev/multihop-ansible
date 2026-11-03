@@ -305,3 +305,14 @@ def test_entry_uplink_reloads_rules_unconditionally_before_containers():
     assert "when" not in reload_task
     assert reload_i < names.index("Run multihop-uplink container")
     assert reload_i < names.index("Run multihop-uplink-xray container")
+
+
+def test_swap_entry_exit_push_applies_the_exit_plays_roles():
+    exit_play = yaml.safe_load((ROOT / "playbooks/exit.yml").read_text())[0]
+    swap = yaml.safe_load((ROOT / "playbooks/swap-entry.yml").read_text())
+    push = next(p for p in swap if p.get("name") == "Push the new entry-uplink key to the exit")
+    cond = "not _old_entry_reachable"
+    assert len(push["roles"]) == len(exit_play["roles"])
+    for got, want in zip(push["roles"], exit_play["roles"]):
+        assert got["when"] == cond
+        assert {k: v for k, v in got.items() if k != "when"} == want
