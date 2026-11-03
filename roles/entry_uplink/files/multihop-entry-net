@@ -46,9 +46,12 @@
 #   local/bridge  -> 10120 -> main -> local or bridge
 #   other tcp/udp -> TPROXY socket; 10130 -> 51820 -> `local` -> delivered to
 #                    Xray, whose only outbound is the exit. Xray not
-#                    listening: TPROXY drops. TPROXY rule missing: local
-#                    delivery to no socket (RST/unreachable). `local` route
-#                    missing: blackhole. Never forwarded.
+#                    listening: TPROXY drops. TPROXY rule missing: delivered
+#                    locally as if addressed to the entry: dropped or
+#                    answered (RST/unreachable) where nobody listens, but a
+#                    host wildcard listener (sshd, docker-proxy) can receive
+#                    it. `local` route missing: blackhole. Never forwarded,
+#                    so nothing reaches the internet.
 #   other protocols -> DROP in MULTIHOP-TPROXY
 # and the FWD backstop drops anything else that tries to leave a bridge.
 #
