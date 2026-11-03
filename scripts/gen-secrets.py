@@ -3,6 +3,7 @@
 
   gen-secrets.py all         full vault.yml document on stdout
   gen-secrets.py uplink-key  vault_uplink.yml document on stdout
+  gen-secrets.py xray        vault_link_reality + vault_entry_xray blocks on stdout
 """
 import secrets
 import sys
@@ -12,10 +13,31 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins" / "filter"))
 import awg  # noqa: E402
+import xray  # noqa: E402
 
 
 def _dump(doc: dict) -> str:
     return yaml.safe_dump(doc, default_flow_style=False, sort_keys=False, width=1000)
+
+
+def _reality_identity(rng) -> dict:
+    priv = xray.reality_genkey()
+    return {
+        "private_key": priv,
+        "public_key": xray.reality_pubkey(priv),
+        "short_id": xray.gen_short_id(rng),
+    }
+
+
+def _xray_blocks(rng) -> dict:
+    return {
+        "vault_link_reality": _reality_identity(rng),
+        "vault_entry_xray": {"uuid": xray.gen_uuid(), **_reality_identity(rng)},
+    }
+
+
+def gen_xray() -> str:
+    return _dump(_xray_blocks(secrets.SystemRandom()))
 
 
 def gen_all() -> str:
@@ -36,6 +58,7 @@ def gen_all() -> str:
             "psk": awg.genpsk(),
             "params": awg.gen_awg_params(rng),
         },
+        **_xray_blocks(rng),
         "vault_backup_writer": {"access_key": "CHANGE_ME", "secret_key": "CHANGE_ME"},
         "vault_backup_reader": {"access_key": "CHANGE_ME", "secret_key": "CHANGE_ME"},
         "vault_backup_age_identity": "CHANGE_ME",
@@ -50,14 +73,19 @@ def gen_all() -> str:
 
 def gen_uplink_key() -> str:
     priv = awg.genkey()
-    return _dump({"vault_uplink_entry": {"private_key": priv, "public_key": awg.pubkey(priv)}})
+    return _dump({"vault_uplink_entry": {
+        "private_key": priv,
+        "public_key": awg.pubkey(priv),
+        "reality_uuid": xray.gen_uuid(),
+    }})
 
 
 def main(argv: list) -> int:
-    if len(argv) != 2 or argv[1] not in ("all", "uplink-key"):
+    commands = {"all": gen_all, "uplink-key": gen_uplink_key, "xray": gen_xray}
+    if len(argv) != 2 or argv[1] not in commands:
         print(__doc__, file=sys.stderr)
         return 2
-    sys.stdout.write(gen_all() if argv[1] == "all" else gen_uplink_key())
+    sys.stdout.write(commands[argv[1]]())
     return 0
 
 

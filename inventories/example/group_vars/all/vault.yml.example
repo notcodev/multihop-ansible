@@ -6,7 +6,7 @@
 #   uv run ansible-vault encrypt inventories/<name>/group_vars/all/vault.yml
 # The entry-uplink key lives in a separate, rotatable file:
 #   uv run scripts/gen-secrets.py uplink-key > inventories/<name>/group_vars/all/vault_uplink.yml
-#   (vault_uplink_entry: {private_key, public_key}), encrypted the same way.
+#   (vault_uplink_entry: {private_key, public_key, reality_uuid}), encrypted the same way.
 
 # Entry AWG server identity. Seeds the FIRST deploy only; afterwards the backup is the source of truth.
 vault_entry_awg:
@@ -71,6 +71,20 @@ vault_link_awg:
     max_handshake_attempts: 15-20
     random_trailers: 'on'
     disable_cookies: 'on'
+
+# Exit REALITY identity (VLESS+REALITY uplink); must match on both ends, the exit is rebuilt from this.
+# Generate with: uv run scripts/gen-secrets.py xray
+vault_link_reality:
+  private_key: FAKE-reality-private-key-placeholder-000
+  public_key: FAKE-reality-public-key-placeholder-0000
+  short_id: 0123456789abcdef
+
+# Entry Xray server identity. Seeds the FIRST deploy only; afterwards the backup is the source of truth.
+vault_entry_xray:
+  uuid: 00000000-0000-4000-8000-000000000000
+  private_key: FAKE-entry-xray-private-key-placeholder0
+  public_key: FAKE-entry-xray-public-key-placeholder00
+  short_id: fedcba9876543210
 
 # S3 credentials: writer goes onto the entry, reader stays on the controller (restore).
 # They may be the same key if your provider cannot separate them.
