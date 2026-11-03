@@ -203,12 +203,61 @@ archive_members() { tail -n +2 "$UPLOADS/$(uploaded_objects)" | tar -tf - | sed 
   [ "$(tail -n +2 "$UPLOADS/$(uploaded_objects)" | tar -xOf - ./xray/xray_uuid.key)" = "v-uuid" ]
 }
 
-@test "xray state without server.json is not archived" {
+# A backup that silently lacks part of the Xray state would become `latest`
+# and restore an Xray that does not work: with Xray enabled, each required
+# file must be a regular file, or nothing is uploaded and `latest` stays.
+assert_refused_without_upload() { # <file named in the error>
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ERROR: $XRAY_DIR/$1 "* ]] || false
+  [ -z "$(uploaded_objects)" ]
+  [ ! -e "$UPLOADS/latest" ]
+  ! grep -q '^aws ' "$STUB_LOG" || false
+  [ "$(cat "$MULTIHOP_STATE_DIR/backup/last.sha256" 2>/dev/null)" = "${2:-}" ]
+}
+
+@test "xray enabled: a missing required file fails without uploading or moving latest" {
+  local f
+  for f in server.json xray_uuid.key xray_private.key xray_public.key xray_short_id.key; do
+    rm -rf "$XRAY_DIR" "$UPLOADS"/*; : > "$STUB_LOG"
+    sed -i.bak '/^ENTRY_XRAY_STATE_DIR=/d' "$MULTIHOP_ENV"
+    with_xray
+    rm "$XRAY_DIR/$f"
+    run_script multihop-backup
+    echo "$f: $status $output"
+    assert_refused_without_upload "$f"
+  done
+}
+
+@test "xray enabled: a required file that is not a regular file fails without uploading" {
   with_xray
-  rm "$XRAY_DIR/server.json"
   run_script multihop-backup
   [ "$status" -eq 0 ]
-  ! archive_members | grep -q xray || false
+  good="$(cat "$MULTIHOP_STATE_DIR/backup/last.sha256")"
+  rm -f "$UPLOADS"/*; : > "$STUB_LOG"
+  rm "$XRAY_DIR/xray_public.key"; ln -s /etc/hosts "$XRAY_DIR/xray_public.key"
+  run_script multihop-backup --force
+  assert_refused_without_upload xray_public.key "$good"
+  rm "$XRAY_DIR/xray_public.key"; mkdir "$XRAY_DIR/xray_public.key"
+  run_script multihop-backup --force
+  assert_refused_without_upload xray_public.key "$good"
+  rm "$XRAY_DIR/server.json"; ln -s "$XRAY_DIR/xray_uuid.key" "$XRAY_DIR/server.json"
+  run_script multihop-backup --force
+  [ "$status" -eq 1 ]
+  [ -z "$(uploaded_objects)" ]
+}
+
+@test "xray enabled: clientsTable stays optional" {
+  with_xray
+  run_script multihop-backup
+  [ "$status" -eq 0 ]
+  archive_members | grep -qx './xray/server.json'
+  ! archive_members | grep -q clientsTable || false
+  rm -f "$UPLOADS"/*
+  ln -s /etc/hosts "$XRAY_DIR/clientsTable"
+  run_script multihop-backup --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"clientsTable is not a regular file, left out"* ]] || false
+  ! archive_members | grep -q clientsTable || false
 }
 
 @test "xray drift writes DRIFT, still uploads, exits 2" {
@@ -311,8 +360,9 @@ exec "$real_cp" "\$@"
 STUB
   chmod +x "$BATS_TEST_TMPDIR/bin/cp"
   run_script multihop-backup
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"xray_private.key is not a regular file, left out"* ]]
-  ! archive_members | grep -q xray_private.key || false
-  ! tail -n +2 "$UPLOADS/$(uploaded_objects)" | grep -aq TOP-SECRET || false
+  # a required file: dropped, so the whole backup is refused
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ERROR: $XRAY_DIR/xray_private.key is not a regular file"* ]] || false
+  [ -z "$(uploaded_objects)" ]
+  ! grep -raq TOP-SECRET "$UPLOADS" || false
 }

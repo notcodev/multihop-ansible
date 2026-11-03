@@ -8,8 +8,9 @@
 #
 # Archive: the AWG state dir's files sit at the archive root (`./awg0.conf`,
 # ...), which is what roles/entry_app/tasks/restore.yml expects. With
-# ENTRY_XRAY_STATE_DIR set (Xray enabled) and a server.json in it, the app's
-# Xray files go under `./xray/` (only the six names below, regular files). The
+# ENTRY_XRAY_STATE_DIR set (Xray enabled) the app's Xray files go under
+# `./xray/` (only the six names below, regular files; all but clientsTable
+# required, else exit 1 without uploading). The
 # archive is deterministic (sorted, zeroed mtime/owner), so its sha256 only
 # changes when either state changes; without Xray it is byte-identical to the
 # archive of the AWG dir alone.
@@ -96,7 +97,10 @@ if [ -e "$root/xray" ] || [ -L "$root/xray" ]; then
   echo "ERROR: $ENTRY_STATE_DIR/xray exists; it would clash with the Xray state in the archive" >&2
   exit 1
 fi
-if [ -n "$XRAY_STATE_DIR" ] && [ -f "$XRAY_STATE_DIR/server.json" ] && [ ! -L "$XRAY_STATE_DIR/server.json" ]; then
+# With Xray enabled every file but clientsTable is required: a backup missing
+# one would become `latest` and restore an Xray that cannot work, so the run
+# fails (exit 1) before anything is uploaded.
+if [ -n "$XRAY_STATE_DIR" ]; then
   mkdir -m 0700 "$root/xray"
   for f in $XRAY_FILES; do
     src="$XRAY_STATE_DIR/$f"
@@ -104,15 +108,18 @@ if [ -n "$XRAY_STATE_DIR" ] && [ -f "$XRAY_STATE_DIR/server.json" ] && [ ! -L "$
     # -P: a symlink swapped in after the test is copied as a link, never
     # followed; the re-check then drops it (the restore would refuse it).
     if [ -f "$src" ] && [ ! -L "$src" ]; then cp -P -p "$src" "$dst"; fi
-    if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then
-      echo "WARNING: $src is not a regular file, left out" >&2
-      rm -f "$dst"
+    if [ -L "$dst" ] || { [ -e "$dst" ] && [ ! -f "$dst" ]; }; then rm -f "$dst"; fi
+    [ ! -f "$dst" ] || continue
+    if [ -e "$src" ] || [ -L "$src" ]; then what="is not a regular file"; else what="is missing"; fi
+    if [ "$f" = clientsTable ]; then
+      [ "$what" = "is missing" ] || echo "WARNING: $src $what, left out" >&2
+    else
+      echo "ERROR: $src $what; the Xray state is incomplete, nothing uploaded (latest unchanged)" >&2
+      exit 1
     fi
   done
   touch -r "$XRAY_STATE_DIR" "$root/xray"
   touch -r "$ENTRY_STATE_DIR" "$root"
-elif [ -n "$XRAY_STATE_DIR" ]; then
-  echo "no $XRAY_STATE_DIR/server.json yet, backing up the AWG state only"
 fi
 $TAR --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$root" -cf - . > "$tmp"
 hash="$(sha256 < "$tmp")"
