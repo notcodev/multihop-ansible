@@ -376,6 +376,8 @@ def test_swap_exit_reality_restarts_uplink_xray_and_waits_for_connection():
     task = flat[restart][1]
     assert task["community.docker.docker_container"]["restart"] is True
     assert "reality" in task["when"]
+    # an action, not drift: the lab swap check wants entry changed=0
+    assert task["changed_when"] is False
     wait = next(n for n, (i, t) in enumerate(flat) if "state established" in _dump(t))
     assert wait > restart
     w = flat[wait][1]
@@ -386,6 +388,28 @@ def test_swap_exit_reality_restarts_uplink_xray_and_waits_for_connection():
     for n, (i, t) in enumerate(flat):
         if "wait-handshake.yml" in _dump(t):
             assert "!= 'reality'" in str(t.get("when", "")) or "== 'awg'" in str(t.get("when", ""))
+
+
+def test_swap_exit_old_exit_plays_tolerate_an_unreachable_old_exit():
+    # The old exit may be dead (that is often why it is swapped): its plays
+    # must not fail the swap.
+    plays = [p for p in _plays("playbooks/swap-exit.yml") if p.get("hosts") == "exit_old"]
+    assert len(plays) == 2
+    for play in plays:
+        assert play.get("ignore_unreachable") is True, play["name"]
+
+
+def test_lab_swap_check_allows_exactly_the_current_entry_plays():
+    # run.sh's swap check fails on any play touching the entry that is not
+    # in SWAP_ENTRY_PLAYS (a grep -E alternation of full play names).
+    text = (ROOT / "tests/integration/run.sh").read_text()
+    pattern = re.search(r'^SWAP_ENTRY_PLAYS="([^"]*)"', text, re.M).group(1)
+    plays = _plays("playbooks/swap-exit.yml") + _plays("playbooks/verify.yml")
+    names = {p["name"] for p in plays if "name" in p}
+    allowed = {n for n in names if re.fullmatch(pattern, n)}
+    assert len(allowed) == len(pattern.split("|"))  # no stale alternative
+    assert {p["name"] for p in plays if p.get("hosts") == "entry"} <= allowed
+    assert "Point the exit DNS record at the new exit" in allowed  # hostsfile backend delegates to the entry
 
 
 def test_verify_fail_closed_stops_uplink_xray_in_reality_mode():

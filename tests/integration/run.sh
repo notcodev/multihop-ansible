@@ -45,7 +45,7 @@ KNOWN_HOSTS="${KNOWN_HOSTS:-$STATE/known_hosts}"
 CLIENT_IP="${CLIENT_IP:-${EXIT2_IP:-${EXIT_IP:-}}}"
 CLIENT_TUN_IP=10.8.1.2
 # The only plays of swap-exit.yml allowed to touch the entry.
-SWAP_ENTRY_PLAYS="Point the exit DNS record at the new exit|Wait for the entry to handshake with the new exit|Verify the entry egresses through the exit"
+SWAP_ENTRY_PLAYS="Point the exit DNS record at the new exit|Flush the entry resolver and stop the old exit \(awg\)|Wait for the entry to reach the new exit|Verify the entry egresses through the exit"
 # Reports changed on every run by design (fills the split sets now).
 ALWAYS_CHANGED="split_routing : Run the first refresh"
 mkdir -p "$LOGS"

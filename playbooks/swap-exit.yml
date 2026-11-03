@@ -49,11 +49,13 @@
 
 # awg mode: the old exit has the same identity and keys and still carries
 # traffic, so its handshakes keep pulling the entry's peer endpoint back by
-# roaming. It must be down before we wait for the new one.
+# roaming. It must be down before we wait for the new one. A dead old exit
+# (unreachable) is already down: that must not fail the swap.
 - name: Stop the old exit before waiting for the new one (awg)
   hosts: exit_old
   become: true
   gather_facts: false
+  ignore_unreachable: true
   roles:
     - multihop_defaults
   tasks:
@@ -84,11 +86,13 @@
     _new_exit_ip: "{{ hostvars[groups['exit'][0]]['ansible_host'] }}"
     _uplink_base: "{{ (uplink_subnet | split('/'))[0].split('.') }}"
   tasks:
+    # An action, not config drift: never reported as a change on the entry.
     - name: Restart multihop-uplink-xray to pick up the new exit address
       community.docker.docker_container:
         name: multihop-uplink-xray
         state: started
         restart: true
+      changed_when: false
       when: uplink_transport == 'reality'
 
     # Each client connection is its own short TCP connection to the exit, so
@@ -164,6 +168,7 @@
   hosts: exit_old
   become: true
   gather_facts: false
+  ignore_unreachable: true
   roles:
     - multihop_defaults
   tasks:
