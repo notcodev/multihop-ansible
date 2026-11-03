@@ -140,3 +140,158 @@ def test_required_files_and_text(tmp_path):
     probs = _problems(tmp_path, members=[(".", "dir", None), ("./awg0.conf", "file", b"\xff\xfe")])
     assert any("wireguard_server_private_key.key" in p for p in probs), probs
     assert any("UTF-8" in p for p in probs), probs
+
+
+# --- the entry Xray state under ./xray/ ---------------------------------------
+
+import json  # noqa: E402
+
+XRAY_PORT = 443
+SERVER_JSON = (ROOT / "tests" / "fixtures" / "amnezia-xray-server.json").read_text()
+XRAY_KEYS = {
+    "xray_uuid.key": "22222222-2222-4222-8222-222222222222\n",
+    "xray_private.key": "eHJheXByaXZhdGVrZXl4cmF5cHJpdmF0ZWtleXhyYXk\n",
+    "xray_public.key": "eHJheXB1YmxpY2tleXhyYXlwdWJsaWNrZXl4cmF5cHU\n",
+    "xray_short_id.key": "fedcba9876543210\n",
+}
+
+
+def _xray(server=SERVER_JSON, keys=None, extra=()):
+    keys = XRAY_KEYS if keys is None else keys
+    return [("./xray", "dir", None), ("./xray/server.json", "file", server),
+            *[(f"./xray/{k}", "file", v) for k, v in keys.items()], *extra]
+
+
+def _xray_problems(tmp_path, xray_port=XRAY_PORT, **kw):
+    return backup.backup_archive_problems(_tar(tmp_path / "b.tar", **kw), PORT, SUBNET,
+                                          xray_port)
+
+
+def _server(mutate):
+    cfg = json.loads(SERVER_JSON)
+    mutate(cfg)
+    return json.dumps(cfg)
+
+
+def test_xray_dir_accepted(tmp_path):
+    clients = _xray(extra=[("./xray/clientsTable", "file", '[{"clientId": "x"}]\n')])
+    assert _xray_problems(tmp_path, extra=clients) == []
+
+
+def test_xray_unknown_file_rejected(tmp_path):
+    probs = _xray_problems(tmp_path, extra=_xray(extra=[("./xray/evil.sh", "file", "id\n")]))
+    assert any("xray/evil.sh" in p for p in probs), probs
+
+
+def test_xray_nested_dir_rejected(tmp_path):
+    probs = _xray_problems(tmp_path, extra=_xray(extra=[("./xray/a", "dir", None),
+                                                        ("./xray/a/b", "file", "x")]))
+    assert any("xray/a/b" in p for p in probs), probs
+    assert any("'./xray/a'" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("kind,data", [("symlink", "/etc/shadow"), ("hardlink", "./awg0.conf"),
+                                       ("chr", None), ("fifo", None)])
+def test_xray_non_regular_members_rejected(tmp_path, kind, data):
+    keys = {k: v for k, v in XRAY_KEYS.items() if k != "xray_private.key"}
+    probs = _xray_problems(tmp_path, extra=_xray(keys=keys, extra=[
+        ("./xray/xray_private.key", kind, data)]))
+    assert any("xray/xray_private.key" in p and "regular file" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("name", ["./xray/../etc/x", "/xray/server.json", "xray/./server.json"])
+def test_xray_odd_paths_rejected(tmp_path, name):
+    probs = _xray_problems(tmp_path, extra=_xray(extra=[(name, "file", "x")]))
+    assert any(name in p for p in probs), probs
+
+
+def test_xray_root_name_must_be_the_directory(tmp_path):
+    probs = _xray_problems(tmp_path, extra=[("./xray", "file", "x")])
+    assert any("'./xray'" in p and "directory" in p for p in probs), probs
+
+
+def test_xray_required_files(tmp_path):
+    probs = _xray_problems(tmp_path, extra=_xray(keys={}))
+    for name in XRAY_KEYS:
+        assert any(f"xray/{name} is missing" in p for p in probs), probs
+    probs = _xray_problems(tmp_path, extra=[("./xray", "dir", None)])
+    assert any("xray/server.json is missing" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("mutate,needle", [
+    (lambda c: c.update(routing={"rules": []}), "'routing'"),
+    (lambda c: c.update(api={"tag": "api"}), "'api'"),
+    (lambda c: c.update(stats={}), "'stats'"),
+    (lambda c: c.update(policy={}), "'policy'"),
+    (lambda c: c["inbounds"].append({**c["inbounds"][0], "port": 10085}), "exactly one inbound"),
+    (lambda c: c["outbounds"].__setitem__(0, {"protocol": "blackhole"}), "outbounds"),
+    (lambda c: c["outbounds"].append({"protocol": "freedom", "tag": "x"}), "outbounds"),
+    (lambda c: c["outbounds"][0].update(settings={"redirect": "127.0.0.1:22"}), "outbounds"),
+    (lambda c: c.update(log={"loglevel": "error", "access": "/opt/amnezia/start.sh"}), "log"),
+    (lambda c: c["inbounds"][0].update(protocol="dokodemo-door"), "vless"),
+    (lambda c: c["inbounds"][0].update(listen="0.0.0.0"), "'listen'"),
+    (lambda c: c["inbounds"][0]["settings"].update(decryption="mlkem"), "decryption"),
+    (lambda c: c["inbounds"][0]["settings"].update(fallbacks=[{"dest": 22}]), "'fallbacks'"),
+    (lambda c: c["inbounds"][0]["settings"]["clients"].append({"id": "x", "flow": "", "email": "e"}),
+     "clients"),
+    (lambda c: c["inbounds"][0]["settings"].update(clients={}), "clients"),
+    (lambda c: c["inbounds"][0]["streamSettings"].update(security="tls"), "reality"),
+    (lambda c: c["inbounds"][0]["streamSettings"].update(network="ws"), "network"),
+    (lambda c: c["inbounds"][0]["streamSettings"].update(sockopt={"mark": 1}), "'sockopt'"),
+    (lambda c: c["inbounds"][0]["streamSettings"].pop("realitySettings"), "realitySettings"),
+    (lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(dest="/run/x.sock"),
+     "dest"),
+    (lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(xver=2), "'xver'"),
+    (lambda c: c.pop("outbounds"), "outbounds"),
+])
+def test_xray_server_json_extra_sections_rejected(tmp_path, mutate, needle):
+    probs = _xray_problems(tmp_path, extra=_xray(server=_server(mutate)))
+    assert any(needle in p and "server.json" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("server", ["not json", "[]", '{"log": {}}', b"\xff\xfe"])
+def test_xray_server_json_garbage_rejected(tmp_path, server):
+    probs = _xray_problems(tmp_path, extra=_xray(server=server))
+    assert any("server.json" in p for p in probs), probs
+
+
+def test_xray_server_json_wrong_port_rejected(tmp_path):
+    server = _server(lambda c: c["inbounds"][0].update(port=8443))
+    probs = _xray_problems(tmp_path, extra=_xray(server=server))
+    assert any("8443" in p and "entry_xray_port 443" in p for p in probs), probs
+    assert backup.xray_server_json_problems(server, 8443) == []
+    assert backup.xray_server_json_problems(SERVER_JSON, 443) == []
+
+
+def test_xray_port_not_compared_without_xray_port(tmp_path):
+    # Xray disabled: the xray/ dir is not restored, only its structure is checked.
+    server = _server(lambda c: c["inbounds"][0].update(port=8443))
+    assert _xray_problems(tmp_path, xray_port=None, extra=_xray(server=server)) == []
+    probs = _xray_problems(tmp_path, xray_port=None, extra=_xray(extra=[("./xray/x", "file", "")]))
+    assert any("xray/x" in p for p in probs), probs
+
+
+@pytest.mark.parametrize("name,value", [
+    ("xray_uuid.key", "not-a-uuid\n"),
+    ("xray_uuid.key", "22222222-2222-4222-8222-222222222222\nsecond line\n"),
+    ("xray_private.key", "short\n"),
+    ("xray_private.key", "eHJheXByaXZhdGVrZXl4cmF5cHJpdmF0ZWtleXhyYXk=\n"),
+    ("xray_public.key", "eHJheXB1YmxpY2tleXhyYXlwdWJsaWNrZXl4cmF5c+/\n"),
+    ("xray_short_id.key", "fedcba987654321\n"),
+    ("xray_short_id.key", "fedcba9876543210\r\n"),
+    ("xray_short_id.key", ""),
+])
+def test_xray_key_files_must_be_single_line_values(tmp_path, name, value):
+    probs = _xray_problems(tmp_path, extra=_xray(keys={**XRAY_KEYS, name: value}))
+    assert any(f"xray/{name}" in p for p in probs), probs
+
+
+def test_xray_clients_table_must_be_json(tmp_path):
+    probs = _xray_problems(tmp_path, extra=_xray(extra=[("./xray/clientsTable", "file", "{oops")]))
+    assert any("xray/clientsTable" in p and "JSON" in p for p in probs), probs
+
+
+def test_old_backup_without_xray_still_valid(tmp_path):
+    # Archives made before Task 9 have only the AWG files at the root.
+    assert _xray_problems(tmp_path) == []
+    assert backup.backup_archive_problems(_tar(tmp_path / "old.tar"), PORT, SUBNET) == []

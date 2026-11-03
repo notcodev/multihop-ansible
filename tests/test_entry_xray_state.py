@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 
+import pytest
 import yaml
 
 from test_render import FIXTURE_VAULT_PASS, RENDER_DIR, ROOT
@@ -138,3 +139,46 @@ def test_restore_rejects_incomplete_dir_and_keeps_state(tmp_path):
     assert "xray_private.key" in proc.stdout + proc.stderr
     assert [p.name for p in state.iterdir()] == ["server.json"]
     assert (state / "server.json").read_text() == "live\n"
+
+
+def _port_check(tmp_path, state, *args):
+    return _play(tmp_path, "portcheck", SEED_PLAYBOOK, "-e", f"entry_xray_state_dir={state}",
+                 "--tags", "entry_xray_port_check", *args)
+
+
+def test_port_check_passes_without_or_with_a_matching_server_json(tmp_path):
+    state = tmp_path / "state"
+    proc = _port_check(tmp_path, state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state.mkdir()
+    (state / "server.json").write_text(SERVER_JSON.read_text())
+    proc = _port_check(tmp_path, state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "changed=0" in proc.stdout
+
+
+@pytest.mark.parametrize("text, found", [
+    (SERVER_JSON.read_text().replace('"port": 443', '"port": 8443'), "8443"),
+    ("{}\n", "no readable inbounds[0].port"),
+])
+def test_port_check_refuses_another_port(tmp_path, text, found):
+    # The published port, firewall and issued keys are built from entry_xray_port;
+    # the app's server.json keeps the first deploy's port.
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "server.json").write_text(text)
+    proc = _port_check(tmp_path, state)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert found in out and "entry_xray_port is 443" in out
+    assert "cannot change after the first deploy" in out and "restore.yml" in out
+    assert "privateKey" not in out
+    assert (state / "server.json").read_text() == text
+
+
+def test_port_check_is_skipped_during_a_restore(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "server.json").write_text("{}\n")
+    proc = _port_check(tmp_path, state, "-e", f"entry_xray_restore_dir={tmp_path}")
+    assert proc.returncode == 0, proc.stdout + proc.stderr

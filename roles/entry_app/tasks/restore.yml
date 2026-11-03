@@ -39,6 +39,12 @@
     path: "{{ entry_app_staging_dir }}.tar"
     state: absent
 
+# The entry Xray state rides in the same archive; entry_xray restores it.
+- name: Leave the Xray state out of the AWG state
+  ansible.builtin.file:
+    path: "{{ entry_app_staging_dir }}/xray"
+    state: absent
+
 - name: Check required files at the staging root
   ansible.builtin.stat:
     path: "{{ entry_app_staging_dir }}/{{ item }}"

@@ -446,7 +446,7 @@ def test_plays_using_shared_vars_apply_multihop_defaults():
 
 
 def test_roles_using_shared_vars_depend_on_multihop_defaults():
-    for role in ("common", "exit", "entry_uplink", "entry_xray"):
+    for role in ("common", "exit", "entry_uplink", "entry_xray", "backup"):
         assert _role_applies_defaults(role), role
 
 
@@ -528,3 +528,21 @@ def test_entry_xray_drift_checks_want_our_bind_mount():
         that = _dump(tasks[name]["ansible.builtin.assert"]["that"])
         assert "/opt/amnezia/xray" in that and "'bind'" in that
         assert "entry_xray_state_dir" in that
+
+
+def _role_tasks(path, role):
+    names = []
+    for _, t in _flat_tasks(_plays(path)):
+        for key in ("ansible.builtin.import_role", "ansible.builtin.include_role"):
+            if key in t:
+                names.append(t[key]["name"])
+                if t[key]["name"] == role:
+                    yield len(names) - 1, names, t
+
+
+@pytest.mark.parametrize("path", ["playbooks/entry.yml", "playbooks/restore.yml"])
+def test_restore_paths_hand_the_backup_xray_state_to_entry_xray(path):
+    [(pos, names, task)] = list(_role_tasks(path, "entry_xray"))
+    assert "entry_app" in names[:pos]
+    assert task["when"] == "entry_xray_enabled | bool"
+    assert "entry_restore_xray_dir" in task["vars"]["entry_xray_restore_dir"]

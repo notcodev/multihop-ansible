@@ -1,7 +1,8 @@
 ---
 # Controller-side: fetch, decrypt and validate an entry backup.
 #
-# Inputs (plus entry_awg_port and entry_awg_subnet, which the backup must match):
+# Inputs (plus entry_awg_port and entry_awg_subnet, which the backup must match,
+# and entry_xray_enabled / entry_xray_port for its xray/ directory):
 #   backup_object        optional; object name or full key. Default: content of `latest`.
 #   backup_fetch_source  optional; "local:<dir>" reads the encrypted object and `latest`
 #                        from a local directory instead of S3 (test seam).
@@ -9,6 +10,10 @@
 #   entry_restore_archive  controller path of the DECRYPTED tar (contains private keys)
 #   entry_restore_tmpdir   its 0700 directory. THE CALLER MUST DELETE IT after the
 #                          restore play has used it (file: state=absent, in an `always:`).
+#   entry_restore_has_xray whether the backup holds the entry Xray state (xray/)
+#   entry_restore_xray_dir controller path of the extracted, validated xray/ files
+#                          (inside entry_restore_tmpdir) for entry_xray_restore_dir;
+#                          "" when the backup has none or Xray is disabled
 # The tempdir is removed here only if fetch/decrypt/validate fails.
 - name: Fetch, decrypt and validate backup
   vars:
@@ -145,7 +150,9 @@
     # awg-quick runs PreUp/PostUp/... from awg0.conf as root and age gives no
     # authenticity (the recipient is public): a holder of the S3 writer key
     # could plant a backup. Accept only plain files at the archive root and an
-    # allow-listed awg0.conf with this inventory's port and subnet.
+    # allow-listed awg0.conf with this inventory's port and subnet, plus the
+    # app's Xray files under xray/ with a server.json of the app's shape (its
+    # port is compared only when the Xray state will be restored).
     - name: Refuse a backup that could run code or does not fit this entry
       ansible.builtin.assert:
         that: _fb_problems | length == 0
@@ -155,7 +162,54 @@
           -e backup_object=<object from before the compromise>.
         quiet: true
       vars:
-        _fb_problems: "{{ (_fb_dir.path ~ '/backup.tar') | backup_archive_problems(entry_awg_port, entry_awg_subnet) }}"
+        _fb_problems: >-
+          {{ (_fb_dir.path ~ '/backup.tar') | backup_archive_problems(entry_awg_port, entry_awg_subnet,
+             entry_xray_port if entry_xray_enabled | bool else none) }}
+
+    - name: Find the Xray state in the backup
+      ansible.builtin.set_fact:
+        entry_restore_has_xray: "{{ _fb_members.stdout_lines | select('match', '^(\\./)?xray(/|$)') | list | length > 0 }}"
+        _fb_xray_members: "{{ _fb_members.stdout_lines | select('match', '^(\\./)?xray/[^/]+$') | list }}"
+        _fb_xray_stage: "{{ _fb_dir.path }}/xray-restore"
+
+    # Only the validated xray/ members, into the private temp dir.
+    - name: Extract the Xray state for entry_xray
+      when: entry_restore_has_xray and entry_xray_enabled | bool
+      block:
+        - name: Create the Xray staging directory
+          ansible.builtin.file:
+            path: "{{ _fb_xray_stage }}"
+            state: directory
+            mode: "0700"
+          delegate_to: localhost
+          become: false
+
+        - name: Extract xray/ from the backup  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            argv: "{{ ['tar', '-xf', _fb_dir.path ~ '/backup.tar', '-C', _fb_xray_stage] + _fb_xray_members }}"
+          changed_when: true
+          delegate_to: localhost
+          become: false
+
+    - name: Expose the Xray restore directory
+      ansible.builtin.set_fact:
+        entry_restore_xray_dir: >-
+          {{ (_fb_xray_stage ~ '/xray') if (entry_restore_has_xray and entry_xray_enabled | bool) else '' }}
+
+    - name: Notice, Xray state in the backup is not restored
+      ansible.builtin.debug:
+        msg: >-
+          NOTICE: backup {{ _fb_key }} holds Xray state (xray/), but entry_xray_enabled is false:
+          it is not restored. Only the AWG state is.
+      when: entry_restore_has_xray and not entry_xray_enabled | bool
+
+    - name: Notice, the backup has no Xray state
+      ansible.builtin.debug:
+        msg: >-
+          NOTICE: backup {{ _fb_key }} has no Xray state (made before Xray backups or before
+          Xray was enabled). Only the AWG state is restored; entry_xray keeps the entry's
+          current Xray state, or seeds it from vault_entry_xray if there is none.
+      when: not entry_restore_has_xray and entry_xray_enabled | bool
 
     - name: Read server private key from the backup
       ansible.builtin.command:

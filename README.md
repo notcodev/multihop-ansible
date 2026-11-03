@@ -97,12 +97,12 @@ Add the server by **domain** (`entry_domain`) with an SSH user that has sudo. Th
 - The entry runs only `amnezia-awg2` and `multihop-uplink`. Do not add other containers to its Docker bridges: the fail-closed exception for the AWG server's replies assumes `amnezia-awg2` is the only UDP sender on `docker0`/`amn0`.
 - **Do not use the app's "remove / reinstall protocol", and do not edit AmneziaWG settings in the app.** The app reinstalls the container: new server keys, an empty user list, and our bind mount and the fixed NAT port range are gone. Every issued key stops working.
 - Reinstalling also removes the container's fixed NAT port range, the basis of the AWG UDP reply exception, so user UDP from source port `entry_awg_port` could then leave via the entry's own IP.
-- Drift detection: the backup timer checks every run that `amnezia-awg2` still has the bind mount. If not, `multihop-backup` exits with code 2 and writes `/var/lib/multihop/backup/DRIFT`, and `entry.yml` fails with recovery instructions. Look for it with `systemctl status multihop-backup.service` and `journalctl -u multihop-backup`.
+- Drift detection: the backup timer checks every run that `amnezia-awg2` still has the bind mount, and with `entry_xray_enabled` that `amnezia-xray` still bind-mounts `/var/lib/multihop/entry-xray` (the app's reinstall puts its named volume there instead). If not, `multihop-backup` writes `/var/lib/multihop/backup/DRIFT` (one line per drifted container), still backs up the host state directories (they hold the last good state, and drift on one protocol must not stop the other's backup), and exits with code 2; `entry.yml` fails with recovery instructions. Look for it with `systemctl status multihop-backup.service` and `journalctl -u multihop-backup`.
 
 ## Operator constraints
 
 - `entry.yml` needs a working exit: the `amnezia-awg2` image build (and any traffic from the entry's containers) goes through the uplink.
-- `entry_awg_port` and `entry_awg_subnet` cannot change after the first deploy: `awg0.conf` is written only when absent, and a restore refuses a backup with another port or subnet.
+- `entry_awg_port` and `entry_awg_subnet` cannot change after the first deploy: `awg0.conf` is written only when absent, and a restore refuses a backup with another port or subnet. The same holds for `entry_xray_port`: `entry.yml` refuses to run when the entry's `server.json` has another port, and a restore refuses an `xray/server.json` with another port.
 - Docker on the entry does not start if the routing and firewall rules cannot be applied (`ExecStartPre=multihop-entry-net up`): fail-closed rather than forwarding through the entry's IP. Check `systemctl status docker` and `journalctl -u docker` if it stays down; after fixing the cause run `systemctl reset-failed docker docker.socket && systemctl start docker` (systemd stops retrying after a few failed starts).
 - Traffic from the entry's containers may leave only through the uplink, the public interface (direct split list and the AWG server's own UDP), or another Docker bridge. Anything to other NICs (e.g. a provider private network) is dropped. The exit also drops user traffic to private, CGNAT and link-local ranges (provider metadata).
 - After an entry swap with the old entry unreachable, retire the old entry if it comes back: stop `amnezia-awg2` and `multihop-uplink` and disable `multihop-backup.timer`. Its backup timer can otherwise overwrite `latest`.
@@ -127,7 +127,9 @@ uv run ansible-playbook playbooks/restore.yml -e backup_object=entry-<timestamp>
 
 The backup is fetched with the reader credentials, decrypted locally with the age identity from the vault, validated, pushed to the entry and deleted from the controller. Backup content wins over vault values.
 
-Validation refuses any archive member that is not a regular file directly at the archive root, and any `awg0.conf` key outside the AmneziaWG allow-list (no `PreUp`/`PostUp`/`PreDown`/`PostDown`, `SaveConfig`, `Table`, `DNS`; awg-quick would run hooks as root). It also requires `ListenPort` = `entry_awg_port` and `Address` inside `entry_awg_subnet`. age does not prove who wrote a backup, and the entry's writer key can upload one, so if the old entry may have been compromised, restore a `backup_object` from before the compromise instead of `latest`. After a reinstall, the app may have to be re-pointed at the server (same domain, nothing else changes).
+With `entry_xray_enabled` the backup also holds the Xray state under `xray/` (`server.json`, `clientsTable` and the four `xray_*.key` files), and `restore.yml` restores it too. A backup without `xray/` (older, or made before Xray was enabled) restores only the AWG state and leaves the Xray state as it is, or seeds it from `vault_entry_xray` if there is none. A backup with `xray/` restored while Xray is disabled skips it with a notice.
+
+Validation refuses any archive member that is not a regular file directly at the archive root or directly in `xray/` under one of those six names, and any `awg0.conf` key outside the AmneziaWG allow-list (no `PreUp`/`PostUp`/`PreDown`/`PostDown`, `SaveConfig`, `Table`, `DNS`; awg-quick would run hooks as root). It also requires `ListenPort` = `entry_awg_port` and `Address` inside `entry_awg_subnet`. `xray/server.json` must have exactly the app's shape: `log` with only a log level, one VLESS + REALITY inbound on `entry_xray_port`, and only a plain `freedom` outbound (no `routing`, `api`, `stats` or other sections, no other inbounds or outbounds); the key files must be single-line values of the right form. age does not prove who wrote a backup, and the entry's writer key can upload one, so if the old entry may have been compromised, restore a `backup_object` from before the compromise instead of `latest`. After a reinstall, the app may have to be re-pointed at the server (same domain, nothing else changes).
 
 ## Swap the exit
 
@@ -217,7 +219,7 @@ iptables -t mangle -S MULTIHOP-MARK
 ipset list -t                                   # multihop_direct, multihop_force_exit (sizes)
 journalctl -u 'multihop-*' --since '1 hour ago'
 systemctl list-timers 'multihop-*'
-ls /var/lib/multihop/backup/DRIFT               # present = app reinstalled the container
+cat /var/lib/multihop/backup/DRIFT              # present = app reinstalled the named containers
 ```
 
 On the exit:

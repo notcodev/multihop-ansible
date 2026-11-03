@@ -68,6 +68,8 @@
   no_log: true
 
 # Own marker so the other roles' blocks in multihop.env survive re-runs.
+# ENTRY_XRAY_STATE_DIR is empty when Xray is disabled: no xray/ in the archive
+# and no drift check of amnezia-xray.
 - name: Write backup keys to multihop.env
   ansible.builtin.blockinfile:
     path: /etc/multihop/multihop.env
@@ -78,6 +80,7 @@
     marker: "# {mark} ANSIBLE MANAGED BLOCK backup"
     block: |
       ENTRY_STATE_DIR={{ entry_state_dir }}
+      ENTRY_XRAY_STATE_DIR={{ entry_xray_state_dir if entry_xray_enabled | bool else '' }}
       S3_ENDPOINT={{ backup_s3_endpoint }}
       S3_REGION={{ backup_s3_region }}
       BUCKET={{ backup_s3_bucket }}

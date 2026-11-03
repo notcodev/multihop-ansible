@@ -25,6 +25,10 @@ PLAYBOOK = """---
         content: "{{{{ entry_restore_tmpdir }}}}"
         dest: {out}/tmpdir-path
         mode: "0600"
+    - ansible.builtin.copy:
+        content: "{{{{ entry_restore_has_xray }}}} {{{{ entry_restore_xray_dir }}}}"
+        dest: {out}/xray
+        mode: "0600"
 """
 
 
@@ -38,7 +42,9 @@ def _setup(tmp_path, members, vault_priv="K\n"):
         (src / name).parent.mkdir(parents=True, exist_ok=True)
         (src / name).write_text(data)
     tar = tmp_path / "state.tar"
-    subprocess.run(["tar", "-C", str(src), "-cf", str(tar), "."], check=True)
+    # COPYFILE_DISABLE: no AppleDouble ._* members from macOS bsdtar.
+    subprocess.run(["tar", "-C", str(src), "-cf", str(tar), "."], check=True,
+                   env={**os.environ, "COPYFILE_DISABLE": "1"})
     store = tmp_path / "store"
     store.mkdir()
     name = "entry-20260101T000000Z-abcdef123456.tar.age"
@@ -52,6 +58,8 @@ def _setup(tmp_path, members, vault_priv="K\n"):
         "backup_fetch_source": f"local:{store}",
         "entry_awg_port": 51820,
         "entry_awg_subnet": "10.8.1.0/24",
+        "entry_xray_enabled": False,
+        "entry_xray_port": 443,
     }))
     return varsfile, name
 
@@ -127,6 +135,77 @@ def test_backup_for_another_port_is_refused(tmp_path):
     proc, _ = _run(tmp_path, varsfile, ["-e", "entry_awg_port=40000"])
     assert proc.returncode != 0
     assert "ListenPort 51820 != entry_awg_port 40000" in proc.stdout
+
+
+# --- the entry Xray state under xray/ --------------------------------------------
+
+SERVER_JSON = (ROOT / "tests" / "fixtures" / "amnezia-xray-server.json").read_text()
+XRAY = {"xray/server.json": SERVER_JSON,
+        "xray/xray_uuid.key": "22222222-2222-4222-8222-222222222222\n",
+        "xray/xray_private.key": "eHJheXByaXZhdGVrZXl4cmF5cHJpdmF0ZWtleXhyYXk\n",
+        "xray/xray_public.key": "eHJheXB1YmxpY2tleXhyYXlwdWJsaWNrZXl4cmF5cHU\n",
+        "xray/xray_short_id.key": "fedcba9876543210\n",
+        "xray/clientsTable": "[]\n"}
+XRAY_ON = ["-e", "entry_xray_enabled=true"]
+
+
+def _xray_out(out):
+    has, _, path = (out / "xray").read_text().partition(" ")
+    return has, path
+
+
+def test_xray_state_is_staged_for_entry_xray(tmp_path):
+    varsfile, _ = _setup(tmp_path, {**GOOD, **XRAY})
+    proc, out = _run(tmp_path, varsfile, XRAY_ON)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    has, xray_dir = _xray_out(out)
+    tmpdir = (out / "tmpdir-path").read_text()
+    assert has == "True" and xray_dir.startswith(tmpdir + "/")
+    assert {p: open(os.path.join(xray_dir, p)).read() for p in os.listdir(xray_dir)} == {
+        k.split("/", 1)[1]: v for k, v in XRAY.items()}
+    assert "NOTICE:" not in proc.stdout
+    shutil.rmtree(tmpdir)
+
+
+def test_xray_less_backup_with_xray_enabled_leaves_seeding_to_entry_xray(tmp_path):
+    # Review Focus 3: an old backup restores AWG; entry_xray keeps or seeds its state.
+    varsfile, _ = _setup(tmp_path, GOOD)
+    proc, out = _run(tmp_path, varsfile, XRAY_ON)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _xray_out(out) == ("False", "")
+    assert "has no Xray state" in proc.stdout
+    tmpdir = (out / "tmpdir-path").read_text()
+    assert sorted(os.listdir(tmpdir)) == ["backup.tar"]
+    shutil.rmtree(tmpdir)
+
+
+def test_xray_backup_with_xray_disabled_is_skipped_with_a_notice(tmp_path):
+    # Another port is fine here: the Xray state is not restored.
+    server = SERVER_JSON.replace('"port": 443', '"port": 8443')
+    varsfile, _ = _setup(tmp_path, {**GOOD, **XRAY, "xray/server.json": server})
+    proc, out = _run(tmp_path, varsfile)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _xray_out(out) == ("True", "")
+    assert "entry_xray_enabled is false" in proc.stdout
+    tmpdir = (out / "tmpdir-path").read_text()
+    assert sorted(os.listdir(tmpdir)) == ["backup.tar"]
+    shutil.rmtree(tmpdir)
+
+
+@pytest.mark.parametrize("change,needle", [
+    (lambda x: {**x, "xray/server.json": SERVER_JSON.replace('"port": 443', '"port": 8443')},
+     "xray/server.json port 8443 != entry_xray_port 443"),
+    (lambda x: {**x, "xray/server.json": SERVER_JSON.replace('"log"', '"routing": {}, "log"')},
+     "section 'routing' is not allowed"),
+    (lambda x: {**x, "xray/run.sh": "id\n"}, "not an allowed Xray file"),
+])
+def test_bad_xray_state_is_refused_and_cleaned_up(tmp_path, change, needle):
+    varsfile, _ = _setup(tmp_path, {**GOOD, **change(XRAY)})
+    before = _tmp_multihop()
+    proc, _ = _run(tmp_path, varsfile, XRAY_ON)
+    assert proc.returncode != 0
+    assert "is refused" in proc.stdout and needle in proc.stdout, proc.stdout
+    assert _tmp_multihop() <= before
 
 
 # --- production S3 path with a fake `aws` on PATH ---------------------------

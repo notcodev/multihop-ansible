@@ -37,6 +37,43 @@
       User state is gone from the container; recover it by running
       playbooks/restore.yml with a backup archive.
 
+# Pre-check: the published port, the reply exception, the firewall and every
+# issued key are built from entry_xray_port, but the app's server.json keeps the
+# port of the first deploy (the seed is written only once). Read-only; skipped
+# during a restore, whose server.json fetch-backup.yml checked against the port.
+- name: Check the port of the existing Xray server.json
+  when: entry_xray_restore_dir | length == 0
+  tags: [entry_xray_port_check]
+  block:
+    - name: Look for an existing Xray server.json
+      ansible.builtin.stat:
+        path: "{{ entry_xray_state_dir }}/server.json"
+      register: entry_xray_port_stat
+
+    - name: Read the existing Xray server.json
+      ansible.builtin.slurp:
+        src: "{{ entry_xray_state_dir }}/server.json"
+      register: entry_xray_port_conf
+      when: entry_xray_port_stat.stat.exists
+      no_log: true
+
+    - name: Refuse a changed entry_xray_port
+      ansible.builtin.assert:
+        that: entry_xray_port_found == entry_xray_port | int
+        fail_msg: >-
+          {{ entry_xray_state_dir }}/server.json has
+          {{ ('port ' ~ entry_xray_port_found) if entry_xray_port_found is not none
+             else 'no readable inbounds[0].port' }}, but entry_xray_port is {{ entry_xray_port }}.
+          The Xray port cannot change after the first deploy (the app keeps it in
+          server.json and every issued key carries it). Set entry_xray_port back, or
+          restore a backup made for this port (playbooks/restore.yml), or re-seed:
+          stop amnezia-xray, move {{ entry_xray_state_dir }} away and re-run entry.yml
+          (new Xray keys; every Xray user must be re-added).
+        quiet: true
+      when: entry_xray_port_stat.stat.exists
+      vars:
+        entry_xray_port_found: "{{ entry_xray_port_conf.content | b64decode | xray_server_json_port }}"
+
 - name: Restore state from backup
   ansible.builtin.include_tasks: restore.yml
   when: entry_xray_restore_dir | length > 0

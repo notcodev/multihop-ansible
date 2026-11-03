@@ -34,10 +34,14 @@
           ansible.builtin.import_role:
             name: entry_app
 
-        # The app's Xray server; needs the app network entry_app creates.
+        # The app's Xray server; needs the app network entry_app creates. On a
+        # restore it takes the backup's xray/ (fetch-backup.yml extracts it;
+        # empty for a backup without one: the state is kept or seeded).
         - name: Apply entry_xray
           ansible.builtin.import_role:
             name: entry_xray
+          vars:
+            entry_xray_restore_dir: "{{ entry_restore_xray_dir | default('') }}"
           when: entry_xray_enabled | bool
 
         - name: Apply split_routing

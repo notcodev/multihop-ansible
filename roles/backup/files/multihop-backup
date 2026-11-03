@@ -3,13 +3,16 @@
 #
 #   multihop-backup [--force]
 #
-# Exit codes: 0 uploaded or unchanged, 2 drift (amnezia-awg2 lost its bind
-# mount), 1 any other error.
+# Exit codes: 0 uploaded or unchanged, 2 drift (amnezia-awg2 or amnezia-xray
+# lost its bind mount; the host state was still backed up), 1 any other error.
 #
-# Archive: the state dir's files sit at the archive root (`./awg0.conf`, ...),
-# which is what roles/entry_app/tasks/restore.yml expects. The archive is
-# deterministic (sorted, zeroed mtime/owner), so its sha256 only changes when
-# the state changes.
+# Archive: the AWG state dir's files sit at the archive root (`./awg0.conf`,
+# ...), which is what roles/entry_app/tasks/restore.yml expects. With
+# ENTRY_XRAY_STATE_DIR set (Xray enabled) and a server.json in it, the app's
+# Xray files go under `./xray/` (only the six names below, regular files). The
+# archive is deterministic (sorted, zeroed mtime/owner), so its sha256 only
+# changes when either state changes; without Xray it is byte-identical to the
+# archive of the AWG dir alone.
 set -euo pipefail
 umask 077
 
@@ -17,8 +20,11 @@ MULTIHOP_ENV="${MULTIHOP_ENV:-/etc/multihop/multihop.env}"
 STATE="${MULTIHOP_STATE_DIR:-/var/lib/multihop}"
 # MULTIHOP_TAR lets tests swap in a wrapper where GNU tar is not available.
 TAR="${MULTIHOP_TAR:-tar}"
-CONTAINER=amnezia-awg2
-MOUNT_DEST=/opt/amnezia/awg
+AWG_CONTAINER=amnezia-awg2
+AWG_MOUNT_DEST=/opt/amnezia/awg
+XRAY_CONTAINER=amnezia-xray
+XRAY_MOUNT_DEST=/opt/amnezia/xray
+XRAY_FILES="clientsTable server.json xray_private.key xray_public.key xray_short_id.key xray_uuid.key"
 
 force=0
 case "${1:-}" in
@@ -34,6 +40,9 @@ esac
 : "${BUCKET:?BUCKET not set in $MULTIHOP_ENV}"
 : "${PREFIX:?PREFIX not set in $MULTIHOP_ENV}"
 : "${AGE_RECIPIENT:?AGE_RECIPIENT not set in $MULTIHOP_ENV}"
+# Empty when Xray is disabled.
+XRAY_STATE_DIR="${ENTRY_XRAY_STATE_DIR:-}"
+XRAY_STATE_DIR="${XRAY_STATE_DIR%/}"
 
 export AWS_SHARED_CREDENTIALS_FILE="${AWS_SHARED_CREDENTIALS_FILE:-/etc/multihop/aws/credentials}"
 [ -z "${S3_REGION:-}" ] || export AWS_DEFAULT_REGION="$S3_REGION"
@@ -41,29 +50,68 @@ export AWS_SHARED_CREDENTIALS_FILE="${AWS_SHARED_CREDENTIALS_FILE:-/etc/multihop
 bdir="$STATE/backup"
 mkdir -p "$bdir"
 
-# 1. Drift: the app container must still bind-mount the state directory.
-mounts="$(docker inspect --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
-if ! printf '%s\n' "$mounts" | grep -qFx "$MOUNT_DEST"; then
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$bdir/DRIFT"
-  echo "ERROR: $CONTAINER lost its bind mount (app reinstall?) — see README \"Recovery\" (playbooks/restore.yml)" >&2
-  exit 2
+# 1. Drift: each app container must still bind-mount its state directory. A
+# drifted container no longer uses the host dir, which therefore still holds
+# the last good state: back it up anyway (drift on one protocol must not stop
+# the other's backup) and exit 2 at the end.
+mounts() {
+  docker inspect --format '{{range .Mounts}}{{.Type}} {{.Source}} {{.Destination}}{{"\n"}}{{end}}' "$1" 2>/dev/null || true
+}
+drift=()
+# amnezia-awg2: anything at the destination (as roles/entry_app checks).
+if ! mounts "$AWG_CONTAINER" | awk -v d="$AWG_MOUNT_DEST" '$NF == d { f = 1 } END { exit !f }'; then
+  drift+=("$AWG_CONTAINER")
+  echo "ERROR: $AWG_CONTAINER lost its bind mount (app reinstall?) — see README \"Recovery\" (playbooks/restore.yml)" >&2
 fi
-rm -f "$bdir/DRIFT"
+# amnezia-xray: the app's own install mounts its named volume at the same
+# destination, so the source must be our state dir.
+if [ -n "$XRAY_STATE_DIR" ] && ! mounts "$XRAY_CONTAINER" | grep -qFx "bind $XRAY_STATE_DIR $XRAY_MOUNT_DEST"; then
+  drift+=("$XRAY_CONTAINER")
+  echo "ERROR: $XRAY_CONTAINER lost its bind mount of $XRAY_STATE_DIR (app reinstall?) — see README \"Recovery\" (playbooks/restore.yml)" >&2
+fi
+if [ "${#drift[@]}" -gt 0 ]; then
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  for c in "${drift[@]}"; do printf '%s %s\n' "$now" "$c"; done > "$bdir/DRIFT"
+  echo "backing up the host state directories anyway" >&2
+else
+  rm -f "$bdir/DRIFT"
+fi
+finish() { [ "${#drift[@]}" -eq 0 ] || exit 2; exit 0; }
 
 sha256() {
   if command -v sha256sum > /dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
 }
 
-# 2. Deterministic archive, hashed.
+# 2. Stage both states, then a deterministic archive, hashed. cp -a keeps the
+# AWG dir's own mode for the archive root; touch -r keeps directory mtimes
+# stable where tar cannot zero them (bsdtar in tests).
 tmp="$(mktemp "$bdir/archive.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-$TAR --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$ENTRY_STATE_DIR" -cf - . > "$tmp"
+stage="$(mktemp -d "$bdir/stage.XXXXXX")"
+trap 'rm -rf "$tmp" "$stage"' EXIT
+root="$stage/root"
+cp -a "$ENTRY_STATE_DIR" "$root"
+if [ -n "$XRAY_STATE_DIR" ] && [ -f "$XRAY_STATE_DIR/server.json" ] && [ ! -L "$XRAY_STATE_DIR/server.json" ]; then
+  if [ -e "$root/xray" ] || [ -L "$root/xray" ]; then
+    echo "ERROR: $ENTRY_STATE_DIR/xray exists; it would clash with the Xray state in the archive" >&2
+    exit 1
+  fi
+  mkdir -m 0700 "$root/xray"
+  for f in $XRAY_FILES; do
+    src="$XRAY_STATE_DIR/$f"
+    if [ -f "$src" ] && [ ! -L "$src" ]; then cp -p "$src" "$root/xray/$f"; fi
+  done
+  touch -r "$XRAY_STATE_DIR" "$root/xray"
+  touch -r "$ENTRY_STATE_DIR" "$root"
+elif [ -n "$XRAY_STATE_DIR" ]; then
+  echo "no $XRAY_STATE_DIR/server.json yet, backing up the AWG state only"
+fi
+$TAR --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$root" -cf - . > "$tmp"
 hash="$(sha256 < "$tmp")"
 
 # 3. Unchanged?
 if [ "$force" -eq 0 ] && [ -f "$bdir/last.sha256" ] && [ "$(cat "$bdir/last.sha256")" = "$hash" ]; then
   echo "state unchanged, nothing to upload"
-  exit 0
+  finish
 fi
 
 # 4. Encrypt and upload, then the latest pointer, then remember the hash.
@@ -75,3 +123,4 @@ age -r "$AGE_RECIPIENT" < "$tmp" | aws_s3 cp - "s3://$BUCKET/$key" || { echo "ER
 printf '%s' "$key" | aws_s3 cp - "s3://$BUCKET/$PREFIX/latest" || { echo "ERROR: updating latest pointer failed" >&2; exit 1; }
 printf '%s\n' "$hash" > "$bdir/last.sha256"
 echo "uploaded $key"
+finish

@@ -119,3 +119,16 @@ def test_restore_rejects_nested_archive_and_keeps_state(tmp_path):
     assert "does not contain awg0.conf" in proc.stdout + proc.stderr
     assert (state / "awg0.conf").read_text() == "live\n"
     assert (state / "clientsTable").read_text() == "users\n"
+
+
+def test_restore_leaves_the_xray_subdir_out_of_the_awg_state(tmp_path):
+    # The Xray state rides in the same archive under xray/; entry_xray restores it.
+    state = tmp_path / "state"
+    state.mkdir()
+    archive = _make_tar(tmp_path, "with-xray", {
+        "awg0.conf": "restored\n", "wireguard_server_private_key.key": "K\n",
+        "xray/server.json": "{}\n", "xray/xray_uuid.key": "u\n"})
+    proc = _restore(tmp_path, archive, state)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert sorted(p.name for p in state.iterdir()) == [
+        "awg0.conf", "wireguard_server_private_key.key"]

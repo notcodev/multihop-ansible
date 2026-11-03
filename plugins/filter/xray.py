@@ -4,6 +4,7 @@ REALITY keys are X25519 keys encoded as base64url without padding, the
 encoding `xray x25519` prints.
 """
 import base64
+import json
 import random
 import uuid
 
@@ -46,6 +47,15 @@ def xray_port_range(awg_port: int) -> str:
     return f"{awg_port + 1} 65535"
 
 
+def xray_server_json_port(text):
+    """inbounds[0].port of an Xray server.json, or None if it cannot be read."""
+    try:
+        port = json.loads(text)["inbounds"][0]["port"]
+    except (ValueError, TypeError, KeyError, IndexError):
+        return None
+    return port if isinstance(port, int) and not isinstance(port, bool) else None
+
+
 class FilterModule:
     def filters(self):
-        return {"xray_port_range": xray_port_range}
+        return {"xray_port_range": xray_port_range, "xray_server_json_port": xray_server_json_port}
