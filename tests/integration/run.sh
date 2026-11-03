@@ -782,18 +782,34 @@ ck_reality_throughput() { # 20 s download from the AWG client through the whole 
 # fail_closed_reality <check> <ip> <container>: stop <container> on <ip>; neither the
 # AWG client nor the Xray client reaches the internet; start it again.
 fail_closed_reality() {
-  local name="$1" host="$2" ctr="$3" pre rc_awg rc_x
-  xray_client_up || { result FAIL "$name" "the Xray client gets no traffic before the test"; return; }
-  pre=$(xcurl https://api.ipify.org)
+  local name="$1" host="$2" ctr="$3" pre_awg pre_x rc_awg rc_x eif cap
+  eif=$(pubif "$ENTRY_IP")
+  # Pre-checks: both clients must work, or a failing curl while stopped proves nothing.
+  if ! { wait_client && xray_client_up; }; then
+    result FAIL "$name" "a client gets no traffic before the test"; return
+  fi
+  pre_awg=$(client_curl https://api.ipify.org)
+  pre_x=$(xcurl https://api.ipify.org)
+  if [ "$pre_awg" != "$EXIT_NOW" ] || [ "$pre_x" != "$EXIT_NOW" ]; then
+    result FAIL "$name" "pre-check: AWG client egress '$pre_awg', Xray client egress '$pre_x' (exit $EXIT_NOW)"; return
+  fi
+  capture "$ENTRY_IP" 20 "$eif" 'host 1.1.1.1' > "$STATE/cap-entry" &
+  listening "$STATE/cap-entry"
+  # An interrupt must not leave the service stopped.
+  trap 'on "$host" "docker start $ctr" >/dev/null 2>&1' EXIT
+  trap 'exit 130' INT TERM
   on "$host" "docker stop $ctr >/dev/null"
   client_curl -o /dev/null --max-time 8 https://1.1.1.1; rc_awg=$?
   xcurl -o /dev/null --max-time 8 https://1.1.1.1; rc_x=$?
+  wait
+  cap=$(pkts "$STATE/cap-entry")
   on "$host" "docker start $ctr >/dev/null"
+  trap - EXIT INT TERM
   wait_uplink && wait_client && xray_client_up
-  if [ "$rc_awg" -ne 0 ] && [ "$rc_x" -ne 0 ] && [ "$pre" = "$EXIT_NOW" ]; then
-    result PASS "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x (before: Xray client egress $pre); restored after start"
+  if [ "$rc_awg" -ne 0 ] && [ "$rc_x" -ne 0 ] && [ "$cap" = 0 ]; then
+    result PASS "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x (both egressed via $EXIT_NOW before); pkts to/from 1.1.1.1 on entry $eif=0; restored after start"
   else
-    result FAIL "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x; Xray client egress before '$pre' (exit $EXIT_NOW)"
+    result FAIL "$name" "$ctr stopped on $host: AWG client curl rc=$rc_awg, Xray client curl rc=$rc_x; entry $eif pkts to/from 1.1.1.1=$cap"
   fi
 }
 
@@ -811,13 +827,18 @@ ck_fail_closed_reality_no_tproxy() { # the chain flushed: marked packets go to `
   need_reality fail_closed_reality_no_tproxy || return
   local rc eif cap n
   eif=$(pubif "$ENTRY_IP")
+  wait_client || { result FAIL fail_closed_reality_no_tproxy "the AWG client gets no traffic before the test"; return; }
   capture "$ENTRY_IP" 15 "$eif" 'host 1.1.1.1' > "$STATE/cap-entry" &
   listening "$STATE/cap-entry"
+  # An interrupt must not leave the chain flushed.
+  trap 'on "$ENTRY_IP" "systemctl reload multihop-net" >/dev/null 2>&1' EXIT
+  trap 'exit 130' INT TERM
   on "$ENTRY_IP" 'iptables -t mangle -F MULTIHOP-TPROXY'
   client_curl -o /dev/null --max-time 8 https://1.1.1.1; rc=$?
   wait
   cap=$(pkts "$STATE/cap-entry")
   on "$ENTRY_IP" 'systemctl reload multihop-net'
+  trap - EXIT INT TERM
   n=$(on "$ENTRY_IP" 'iptables -t mangle -S MULTIHOP-TPROXY | grep -c -- "-j TPROXY"')
   wait_client
   if [ "$rc" -ne 0 ] && [ "$cap" = 0 ] && [ "${n:-0}" -ge 1 ]; then
