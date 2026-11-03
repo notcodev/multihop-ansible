@@ -595,7 +595,10 @@ def _role_tasks(path, role):
 def test_restore_paths_hand_the_backup_xray_state_to_entry_xray(path):
     [(pos, names, task)] = list(_role_tasks(path, "entry_xray"))
     assert "entry_app" in names[:pos]
-    assert task["when"] == "entry_xray_enabled | bool"
+    want = "entry_xray_enabled | bool"
+    if path == "playbooks/restore.yml":  # -e restore_skip_xray=true leaves Xray untouched
+        want += " and not (restore_skip_xray | default(false) | bool)"
+    assert task["when"] == want
     assert "entry_restore_xray_dir" in task["vars"]["entry_xray_restore_dir"]
 
 
