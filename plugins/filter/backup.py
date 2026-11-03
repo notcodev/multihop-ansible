@@ -278,11 +278,13 @@ def _xray_file_problems(name, data, xray_port):
     return []
 
 
-def backup_archive_problems(path, port, subnet, xray_port=None):
+def backup_archive_problems(path, port, subnet, xray_port=None, skip_xray=False):
     """Return a list of reasons to refuse the decrypted backup tar at `path` (empty = ok).
 
     `xray_port` is entry_xray_port, compared with the port in xray/server.json;
     None skips only that comparison (Xray disabled, xray/ is not restored).
+    `skip_xray` (restore_skip_xray) ignores every member under xray/ (the
+    caller leaves them out of what it restores); odd paths are still refused.
     """
     problems, names, conf, xray, unknown_xray = [], set(), None, {}, False
     try:
@@ -292,6 +294,8 @@ def backup_archive_problems(path, port, subnet, xray_port=None):
     with tar:
         for m in tar.getmembers():
             parts = _parts(m.name)
+            if skip_xray and parts and parts[0] == XRAY_DIR:
+                continue
             if parts is None or (len(parts) > 1 and parts[0] != XRAY_DIR):
                 problems.append(f"member {m.name!r} is not directly at the archive root")
                 continue
@@ -343,4 +347,5 @@ def backup_archive_problems(path, port, subnet, xray_port=None):
 
 class FilterModule:
     def filters(self):
-        return {"backup_archive_problems": backup_archive_problems}
+        return {"backup_archive_problems": backup_archive_problems,
+                "xray_server_json_problems": xray_server_json_problems}

@@ -182,3 +182,36 @@ def test_port_check_is_skipped_during_a_restore(tmp_path):
     (state / "server.json").write_text("{}\n")
     proc = _port_check(tmp_path, state, "-e", f"entry_xray_restore_dir={tmp_path}")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("edit, problem", [
+    (lambda c: c.update(routing={"rules": []}), "section 'routing' is not allowed"),
+    (lambda c: c["outbounds"].append({"protocol": "blackhole"}), "outbounds must be exactly"),
+    (lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(dest="127.0.0.1:443"),
+     "dest must be '<public site name>:443'"),
+])
+def test_deploy_refuses_a_server_json_the_backup_validation_would_refuse(tmp_path, edit, problem):
+    # Caught at deploy (read-only), not at the next restore.
+    cfg = json.loads(SERVER_JSON.read_text())
+    edit(cfg)
+    text = json.dumps(cfg, indent=4) + "\n"
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "server.json").write_text(text)
+    proc = _port_check(tmp_path, state)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert problem in out
+    assert "backup validation" in out and "restore_skip_xray" in out
+    assert cfg["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] not in out
+    assert (state / "server.json").read_text() == text
+
+
+def test_deploy_refuses_duplicate_keys_in_server_json(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    text = SERVER_JSON.read_text().replace('"inbounds"', '"log": {"loglevel": "debug"},\n    "inbounds"', 1)
+    (state / "server.json").write_text(text)
+    proc = _port_check(tmp_path, state)
+    assert proc.returncode != 0
+    assert "duplicate" in (proc.stdout + proc.stderr)

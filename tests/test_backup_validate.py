@@ -342,3 +342,25 @@ def test_xray_reality_dest_must_be_a_public_host_name(tmp_path, dest):
 def test_xray_reality_dest_host_names_pass(tmp_path, dest):
     server = _server(lambda c: c["inbounds"][0]["streamSettings"]["realitySettings"].update(dest=dest))
     assert _xray_problems(tmp_path, extra=_xray(server=server)) == []
+
+
+# restore_skip_xray: the xray/ subtree is ignored (and left out of the restore
+# archive by fetch-backup.yml); the AWG part is validated as always.
+@pytest.mark.parametrize("extra", [
+    _xray(server="{}"),
+    _xray(extra=[("./xray/evil.sh", "file", "id\n"), ("./xray/a", "dir", None),
+                 ("./xray/a/b", "file", "x"), ("./xray/l", "symlink", "/etc/shadow")]),
+    [("./xray", "symlink", "/etc")],
+])
+def test_skip_xray_ignores_the_xray_subtree(tmp_path, extra):
+    path = _tar(tmp_path / "b.tar", extra=extra)
+    assert backup.backup_archive_problems(path, PORT, SUBNET, XRAY_PORT)
+    assert backup.backup_archive_problems(path, PORT, SUBNET, XRAY_PORT, skip_xray=True) == []
+
+
+def test_skip_xray_still_validates_the_awg_part_and_odd_paths(tmp_path):
+    path = _tar(tmp_path / "b.tar", conf=CONF + "PostUp = id\n", extra=_xray())
+    probs = backup.backup_archive_problems(path, PORT, SUBNET, XRAY_PORT, skip_xray=True)
+    assert any("PostUp" in p for p in probs), probs
+    path = _tar(tmp_path / "c.tar", extra=[("./xray/../etc/x", "file", "x")])
+    assert backup.backup_archive_problems(path, PORT, SUBNET, XRAY_PORT, skip_xray=True)

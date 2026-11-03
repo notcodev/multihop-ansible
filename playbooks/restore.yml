@@ -2,6 +2,7 @@
 # Replace the entry's user state (awg0.conf, keys, clientsTable, and with
 # entry_xray_enabled the Xray state under the backup's xray/) with a backup.
 #   ansible-playbook playbooks/restore.yml [-e backup_object=entry-<ts>.tar.age] [-e confirm=yes]
+#     [-e restore_skip_xray=true]   AWG only: ignore the backup's xray/ (e.g. refused)
 # Also the recovery path when the app re-installed amnezia-awg2 or
 # amnezia-xray without the bind mount. Users added after that backup are lost.
 - name: Confirm the restore
@@ -48,13 +49,14 @@
             public: true
 
         # A backup without xray/ leaves the Xray state as it is (or seeds it);
-        # fetch-backup.yml printed a notice.
+        # fetch-backup.yml printed a notice. -e restore_skip_xray=true (a
+        # refused xray/) leaves amnezia-xray and its state untouched.
         - name: Apply entry_xray with the backup
           ansible.builtin.include_role:
             name: entry_xray
           vars:
             entry_xray_restore_dir: "{{ entry_restore_xray_dir }}"
-          when: entry_xray_enabled | bool
+          when: entry_xray_enabled | bool and not (restore_skip_xray | default(false) | bool)
 
       always:
         - name: Delete the decrypted backup from the controller

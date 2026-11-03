@@ -205,7 +205,68 @@ def test_bad_xray_state_is_refused_and_cleaned_up(tmp_path, change, needle):
     proc, _ = _run(tmp_path, varsfile, XRAY_ON)
     assert proc.returncode != 0
     assert "is refused" in proc.stdout and needle in proc.stdout, proc.stdout
+    assert "-e restore_skip_xray=true restores the AWG state alone" in proc.stdout
     assert _tmp_multihop() <= before
+
+
+# --- restore_skip_xray: AWG restored, the backup's xray/ ignored ------------
+
+SKIP = ["-e", "restore_skip_xray=true"]
+
+
+def _members(archive):
+    return sorted(subprocess.run(["tar", "-tf", archive], check=True, capture_output=True,
+                                 text=True).stdout.split())
+
+
+@pytest.mark.parametrize("xray", [
+    {**XRAY, "xray/server.json": SERVER_JSON.replace('"log"', '"routing": {}, "log"')},
+    {**XRAY, "xray/run.sh": "id\n", "xray/sub/evil": "x\n"},
+    XRAY,
+])
+def test_skip_xray_restores_awg_only_from_a_refused_or_valid_xray(tmp_path, xray):
+    varsfile, _ = _setup(tmp_path, {**GOOD, **xray})
+    proc, out = _run(tmp_path, varsfile, XRAY_ON + SKIP)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "WARNING: restore_skip_xray" in proc.stdout
+    assert "left as it is" in proc.stdout
+    has, xray_dir = _xray_out(out)
+    assert xray_dir == ""
+    archive = (out / "archive-path").read_text()
+    names = _members(archive)
+    assert not [n for n in names if "xray" in n], names
+    assert {"./awg0.conf", "./wireguard_server_private_key.key", "./clientsTable"} <= set(names)
+    assert subprocess.run(["tar", "-xOf", archive, "./awg0.conf"], check=True,
+                          capture_output=True, text=True).stdout == GOOD_CONF
+    tmpdir = (out / "tmpdir-path").read_text()
+    assert sorted(os.listdir(tmpdir)) == ["backup.tar"]
+    shutil.rmtree(tmpdir)
+
+
+def test_skip_xray_names_the_ignored_problems(tmp_path):
+    bad = {**XRAY, "xray/server.json": SERVER_JSON.replace('"log"', '"routing": {}, "log"')}
+    varsfile, _ = _setup(tmp_path, {**GOOD, **bad})
+    proc, out = _run(tmp_path, varsfile, XRAY_ON + SKIP)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "section 'routing' is not allowed" in proc.stdout
+    shutil.rmtree((out / "tmpdir-path").read_text())
+
+
+def test_skip_xray_still_refuses_a_bad_awg_state(tmp_path):
+    varsfile, _ = _setup(tmp_path, {**GOOD, **XRAY, "awg0.conf": GOOD_CONF + "PostUp = id\n"})
+    before = _tmp_multihop()
+    proc, _ = _run(tmp_path, varsfile, XRAY_ON + SKIP)
+    assert proc.returncode != 0
+    assert "'PostUp' is not allowed" in proc.stdout
+    assert _tmp_multihop() <= before
+
+
+def test_restore_skip_xray_leaves_entry_xray_out():
+    import yaml
+    plays = yaml.safe_load((ROOT / "playbooks/restore.yml").read_text())
+    task = next(t for t in plays[1]["tasks"][0]["block"]
+                if t.get("name") == "Apply entry_xray with the backup")
+    assert "restore_skip_xray" in str(task["when"])
 
 
 # --- production S3 path with a fake `aws` on PATH ---------------------------

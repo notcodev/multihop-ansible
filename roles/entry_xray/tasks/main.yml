@@ -74,6 +74,25 @@
       vars:
         entry_xray_port_found: "{{ entry_xray_port_conf.content | b64decode | xray_server_json_port }}"
 
+    # The backup validation (plugins/filter/backup.py) refuses any server.json
+    # not in the app's exact shape: catch that here, not at the next restore.
+    - name: Refuse a server.json the backup validation would refuse
+      ansible.builtin.assert:
+        that: entry_xray_shape_problems | length == 0
+        fail_msg: >-
+          {{ entry_xray_state_dir }}/server.json is not in the shape the Amnezia app
+          5.1.0.6 writes, so the backup validation would refuse every backup made from it
+          (restore.yml / swap-entry.yml would fail): {{ entry_xray_shape_problems | join('; ') }}.
+          Undo the manual change (manage the Xray server only from the app), or restore a
+          good backup (playbooks/restore.yml), or re-seed: stop amnezia-xray, move
+          {{ entry_xray_state_dir }} away and re-run entry.yml (new Xray keys). A restore
+          can skip a refused xray/ with -e restore_skip_xray=true (AWG only).
+        quiet: true
+      when: entry_xray_port_stat.stat.exists
+      vars:
+        entry_xray_shape_problems: >-
+          {{ entry_xray_port_conf.content | b64decode | xray_server_json_problems(entry_xray_port | int) }}
+
 - name: Restore state from backup
   ansible.builtin.include_tasks: restore.yml
   when: entry_xray_restore_dir | length > 0
