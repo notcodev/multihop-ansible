@@ -13,6 +13,8 @@
 #                          entry swap to ENTRY2_IP and back (after `swap`)
 #   run.sh clean           remove what the test created on the hosts (optional;
 #                          the hosts are throwaway and deleted by their owner)
+#   run.sh guard           only the prod guard below (every mode but help runs it):
+#                          refuse when a lab IP is an ansible_host of inventories/prod
 #
 # Hosts come from the environment or tests/integration/.state/lab.env:
 #   ENTRY_IP, EXIT_IP     entry and exit
@@ -29,7 +31,9 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-STATE="$ROOT/tests/integration/.state"
+# LAB_STATE and PROD_HOSTS are overridable for the guard's tests only.
+STATE="${LAB_STATE:-$ROOT/tests/integration/.state}"
+PROD_HOSTS="${PROD_HOSTS:-$ROOT/inventories/prod/hosts.yml}"
 INV="$ROOT/inventories/lab"
 LOGS="$STATE/logs"
 RESULTS="$STATE/results.txt"
@@ -50,6 +54,31 @@ export ANSIBLE_VAULT_PASSWORD_FILE="$STATE/vault-pass"
 die() { echo "run.sh: $*" >&2; exit 1; }
 need() { local v; for v in "$@"; do [ -n "${!v:-}" ] || die "$v is not set (env or $STATE/lab.env)"; done; }
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+
+# The lab must never point at a production host: refuse when any lab IP is an
+# ansible_host of the prod inventory. Matched as a whole token anywhere in the
+# file, so inventory host names that are IPs, quoted or flow-style values count
+# too; a vault-encrypted file cannot be checked and is refused as well.
+lab_guard() {
+  local v ip bad=0
+  [ -f "$PROD_HOSTS" ] || return 0
+  if head -c 14 "$PROD_HOSTS" | grep -qF '$ANSIBLE_VAULT'; then
+    echo "run.sh: $PROD_HOSTS is vault-encrypted, cannot check the lab IPs against it: refusing" >&2
+    exit 1
+  fi
+  for v in ENTRY_IP EXIT_IP EXIT2_IP CLIENT_IP ENTRY2_IP LAB_CLIENT_IP; do
+    ip="${!v:-}"
+    [ -n "$ip" ] || continue
+    if grep -qwF -- "$ip" "$PROD_HOSTS"; then
+      echo "run.sh: $v=$ip is a host in $PROD_HOSTS: refusing to touch a production host" >&2
+      bad=1
+    fi
+  done
+  [ "$bad" = 0 ] || exit 1
+}
+case "${1:-}" in
+  init|swap-entry|deploy|client|check|swap|clean|guard) lab_guard ;;
+esac
 
 # Internet SSH bots keep the hosts' sshd at MaxStartups, which drops new
 # connections at random: retry when the connection fails (255).
@@ -1175,5 +1204,6 @@ case "${1:-}" in
   check) shift; cmd_check "$@" ;;
   swap) cmd_swap ;;
   clean) cmd_clean ;;
-  *) sed -n '2,20p' "$0" >&2; exit 2 ;;
+  guard) echo "run.sh: no lab IP is a prod ansible_host" ;;
+  *) sed -n '2,22p' "$0" >&2; exit 2 ;;
 esac
