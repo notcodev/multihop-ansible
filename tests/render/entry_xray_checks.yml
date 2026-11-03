@@ -1,0 +1,10 @@
+---
+- name: Exercise entry_xray/tasks/checks.yml
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Run the entry_xray checks
+      ansible.builtin.import_role:
+        name: entry_xray
+        tasks_from: checks

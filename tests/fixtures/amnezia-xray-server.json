@@ -1,0 +1,39 @@
+{
+    "inbounds": [
+        {
+            "port": 443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "flow": "xtls-rprx-vision",
+                        "id": "22222222-2222-4222-8222-222222222222"
+                    }
+                ],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "realitySettings": {
+                    "dest": "www.googletagmanager.com:443",
+                    "privateKey": "FIXTURE-entry-xray-private-key-00000000",
+                    "serverNames": [
+                        "www.googletagmanager.com"
+                    ],
+                    "shortIds": [
+                        "fedcba9876543210"
+                    ]
+                },
+                "security": "reality"
+            }
+        }
+    ],
+    "log": {
+        "loglevel": "error"
+    },
+    "outbounds": [
+        {
+            "protocol": "freedom"
+        }
+    ]
+}

@@ -1,0 +1,15 @@
+---
+# The Amnezia app's Xray (VLESS + REALITY) server on the entry, adopted and
+# managed by the app like amnezia-awg2. entry_xray_enabled and entry_xray_port
+# are shared knobs in multihop_defaults.
+entry_xray_container: amnezia-xray
+entry_xray_build_dir: /var/lib/multihop/entry-xray-build
+entry_xray_state_dir: /var/lib/multihop/entry-xray
+# REALITY site of the seeded server.json (the app's default). The owner may
+# change it later in the app.
+entry_xray_site: www.googletagmanager.com
+# Set by the restore path: controller-local path of a staged directory holding
+# the Xray state files at its root (server.json, *.key, clientsTable).
+entry_xray_restore_dir: ""
+entry_xray_manage_container: true
+entry_xray_staging_dir: "{{ entry_xray_state_dir }}.restore-staging"

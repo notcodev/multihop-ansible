@@ -1,0 +1,99 @@
+---
+# Restore the Xray state directory from a staged directory on the controller
+# (entry_xray_restore_dir: the backup's Xray files at its root, already
+# decrypted and validated by the caller). The backup wins over vault values
+# (the seed tasks then see server.json and skip).
+- name: Check the staged Xray state on the controller
+  ansible.builtin.stat:
+    path: "{{ entry_xray_restore_dir }}/{{ item }}"
+  delegate_to: localhost
+  become: false
+  loop: [server.json, xray_uuid.key, xray_private.key, xray_public.key, xray_short_id.key]
+  register: entry_xray_restore_stat
+
+- name: Fail if the staged Xray state is incomplete
+  ansible.builtin.assert:
+    that: entry_xray_restore_stat.results | map(attribute='stat.exists') | list | min
+    fail_msg: >-
+      entry_xray_restore_dir {{ entry_xray_restore_dir }} lacks
+      {{ entry_xray_restore_stat.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
+      at its root. Nothing was changed.
+
+# Upload into a staging directory first; the live state directory and the
+# container are untouched until the upload is complete.
+- name: Reset Xray staging directory
+  ansible.builtin.file:
+    path: "{{ entry_xray_staging_dir }}"
+    state: "{{ item }}"
+    mode: "0700"
+  loop: [absent, directory]
+
+- name: Upload the staged Xray state
+  ansible.builtin.copy:
+    src: "{{ entry_xray_restore_dir }}/"
+    dest: "{{ entry_xray_staging_dir }}/"
+    mode: "0600"
+    directory_mode: "0700"
+  no_log: true
+
+- name: Look up the Xray container
+  community.docker.docker_container_info:
+    name: "{{ entry_xray_container }}"
+  register: entry_xray_restore_info
+  when: entry_xray_manage_container | bool
+
+- name: Stop the Xray container
+  community.docker.docker_container:
+    name: "{{ entry_xray_container }}"
+    state: stopped
+  when: entry_xray_restore_info.exists | default(false)
+
+- name: Create Xray state directory
+  ansible.builtin.file:
+    path: "{{ entry_xray_state_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: List current Xray state files
+  ansible.builtin.find:
+    paths: "{{ entry_xray_state_dir }}"
+    hidden: true
+    file_type: any
+  register: entry_xray_old_files
+
+- name: Remove current Xray state files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ entry_xray_old_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Move staged files into the Xray state directory
+  ansible.builtin.command: cp -a "{{ entry_xray_staging_dir }}/." "{{ entry_xray_state_dir }}/"
+  changed_when: true
+
+- name: Remove Xray staging directory
+  ansible.builtin.file:
+    path: "{{ entry_xray_staging_dir }}"
+    state: absent
+
+- name: Read restored Xray private key
+  ansible.builtin.slurp:
+    src: "{{ entry_xray_state_dir }}/xray_private.key"
+  register: entry_xray_restored_key
+  no_log: true
+
+- name: Warn when the Xray backup differs from the vault
+  ansible.builtin.debug:
+    msg: >-
+      The restored Xray private key differs from vault_entry_xray.private_key.
+      The backup wins; update the vault if it should match.
+  when:
+    - (entry_xray_restored_key.content | b64decode | trim) != (vault_entry_xray.private_key | default(''))
+
+- name: Start the Xray container again
+  community.docker.docker_container:
+    name: "{{ entry_xray_container }}"
+    state: started
+  when: entry_xray_restore_info.exists | default(false)

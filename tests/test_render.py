@@ -317,3 +317,53 @@ def test_uplink_xray_config():
         "shortId": fx["vault_link_reality"]["short_id"]}
     assert not [o for o in cfg["outbounds"] if o["protocol"] in ("freedom", "blackhole")]
     assert cfg["policy"]["levels"]["0"]["connIdle"] >= 300
+
+
+XRAY_UPSTREAM = ROOT / "tests" / "fixtures" / "amnezia-xray-ac175c8"
+XRAY_SERVER_JSON = ROOT / "tests" / "fixtures" / "amnezia-xray-server.json"
+
+
+def test_entry_xray_server_json():
+    # What XrayServerConfig::toServerInboundJson writes for the app defaults
+    # (raw + reality + xtls-rprx-vision, www.googletagmanager.com, port 443).
+    fx = _fixture()["vault_entry_xray"]
+    expected_text = XRAY_SERVER_JSON.read_text()
+    expected = json.loads(expected_text)
+    (inb,) = expected["inbounds"]
+    assert inb["settings"]["clients"] == [{"id": fx["uuid"], "flow": "xtls-rprx-vision"}]
+    rs = inb["streamSettings"]["realitySettings"]
+    assert rs["privateKey"] == fx["private_key"] and rs["shortIds"] == [fx["short_id"]]
+
+    text = render("roles/entry_xray/templates/server.json.j2", "server.json")
+    assert json.loads(text) == expected
+    # QJsonDocument::toJson(): sorted keys, 4-space indent, trailing newline.
+    assert text == expected_text
+
+
+def test_entry_xray_server_json_follows_site_and_port():
+    cfg = json.loads(render("roles/entry_xray/templates/server.json.j2", "server.json",
+                            {"entry_xray_site": "example.org", "entry_xray_port": 8443}))
+    (inb,) = cfg["inbounds"]
+    assert inb["port"] == 8443
+    assert inb["streamSettings"]["realitySettings"]["dest"] == "example.org:443"
+    assert inb["streamSettings"]["realitySettings"]["serverNames"] == ["example.org"]
+
+
+@pytest.mark.parametrize("port", [443, 8443])
+def test_entry_xray_start_sh(port):
+    upstream = (XRAY_UPSTREAM / "start.sh").read_text()
+    assert "$XRAY_SERVER_PORT" in upstream
+    text = render("roles/entry_xray/templates/start.sh.j2", "xray-start.sh",
+                  {"entry_xray_port": port})
+    assert text == upstream.replace("$XRAY_SERVER_PORT", str(port))
+
+
+def test_entry_xray_dockerfile_is_upstream_with_copy():
+    ours = (ROOT / "roles/entry_xray/files/Dockerfile").read_text()
+    header, sep, body = ours.partition("FROM ")
+    assert sep and "ac175c8" in header
+    assert all(ln.startswith("#") for ln in header.splitlines())
+    placeholder = 'RUN echo -e "#!/bin/bash\\ntail -f /dev/null" > /opt/amnezia/start.sh\n'
+    upstream = (XRAY_UPSTREAM / "Dockerfile").read_text()
+    assert placeholder in upstream
+    assert sep + body == upstream.replace(placeholder, "COPY start.sh /opt/amnezia/start.sh\n")

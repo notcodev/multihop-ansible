@@ -1,0 +1,34 @@
+---
+# Refuse settings that cannot work before anything is changed on the host.
+# amnezia-xray publishes entry_xray_port on tcp and udp (as the app does).
+- name: Check vault_entry_xray
+  ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+  vars:
+    assert_vault_var: vault_entry_xray
+    assert_vault_keys: [uuid, private_key, public_key, short_id]
+    assert_vault_hint: uv run scripts/gen-secrets.py xray
+
+- name: Refuse an Xray port another entry service uses
+  ansible.builtin.assert:
+    that: entry_xray_port | int != item.port | int
+    fail_msg: >-
+      entry_xray_port {{ entry_xray_port }} collides with {{ item.var }}
+      ({{ item.port }}): pick another port for one of them
+    quiet: true
+  loop:
+    - { var: ssh_port, port: "{{ ssh_port }}" }
+    - { var: entry_awg_port, port: "{{ entry_awg_port }}" }
+    - { var: uplink_tproxy_port, port: "{{ uplink_tproxy_port }}" }
+  loop_control:
+    label: "{{ item.var }}"
+
+- name: Refuse an Xray port listed in the INPUT firewall ports
+  ansible.builtin.assert:
+    that: (entry_xray_port | int) not in (entry_xray_listed | map('int') | list)
+    fail_msg: >-
+      entry_xray_port {{ entry_xray_port }} is also listed in {{ item }}
+      ({{ entry_xray_listed | join(', ') }}): pick another port for one of them
+    quiet: true
+  loop: [extra_input_tcp_ports, common_input_tcp_ports, common_input_udp_ports]
+  vars:
+    entry_xray_listed: "{{ lookup('ansible.builtin.vars', item, default=[]) }}"

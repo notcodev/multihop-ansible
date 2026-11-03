@@ -7,6 +7,7 @@
   vars_files:
     - ../../roles/multihop_defaults/defaults/main.yml
     - ../../roles/common/defaults/main.yml
+    - ../../roles/entry_xray/defaults/main.yml
     - fixture_vars.yml
   tasks:
     - name: Create output dir

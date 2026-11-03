@@ -420,6 +420,17 @@ def _task_text(play):
     return text
 
 
+def _play_roles(play):
+    """Roles under `roles:` plus those imported by tasks: import_role exposes
+    their defaults to the whole play at parse time (include_role does not)."""
+    roles = [r["role"] if isinstance(r, dict) else r for r in play.get("roles") or []]
+    for _, t in _flat_tasks([play]):
+        for key in ("ansible.builtin.import_role", "import_role"):
+            if key in t:
+                roles.append(t[key]["name"])
+    return roles
+
+
 def test_plays_using_shared_vars_apply_multihop_defaults():
     problems = []
     for path in sorted((ROOT / "playbooks").glob("*.yml")):
@@ -429,12 +440,91 @@ def test_plays_using_shared_vars_apply_multihop_defaults():
             text = _task_text(play) + yaml.safe_dump(play.get("roles") or [])
             if not any(v in text for v in SHARED_VARS):
                 continue
-            roles = [r["role"] if isinstance(r, dict) else r for r in play.get("roles") or []]
-            if not any(_role_applies_defaults(r) for r in roles):
+            if not any(_role_applies_defaults(r) for r in _play_roles(play)):
                 problems.append(f"{path.name}: {play.get('name')}")
     assert not problems, problems
 
 
 def test_roles_using_shared_vars_depend_on_multihop_defaults():
-    for role in ("common", "exit", "entry_uplink"):
+    for role in ("common", "exit", "entry_uplink", "entry_xray"):
         assert _role_applies_defaults(role), role
+
+
+def _entry_xray_checks(extra):
+    fx = yaml.safe_load((ROOT / "tests" / "render" / "fixture_vars.yml").read_text())
+    args = {k: fx[k] for k in ("ssh_port", "entry_awg_port", "extra_input_tcp_ports",
+                               "vault_entry_xray")}
+    args.update(extra)
+    args = {k: v for k, v in args.items() if v is not None}
+    proc = subprocess.run(
+        ["ansible-playbook", "-i", "localhost,", "-e", "ansible_connection=local",
+         str(ROOT / "tests" / "render" / "entry_xray_checks.yml"), "-e", json.dumps(args)],
+        cwd=ROOT, env=_env(), capture_output=True, text=True)
+    fatal = [json.loads(ln.split("=> ", 1)[1]) for ln in proc.stdout.splitlines()
+             if ln.startswith(("fatal: [localhost]", "failed: [localhost]"))]
+    return proc, fatal
+
+
+def test_entry_xray_checks_pass_with_fixture_values():
+    proc, fatal = _entry_xray_checks({})
+    assert proc.returncode == 0 and not fatal, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("extra, var", [
+    ({"entry_xray_port": 22}, "ssh_port"),
+    ({"entry_xray_port": 8443, "extra_input_tcp_ports": [80, 8443]}, "extra_input_tcp_ports"),
+    ({"entry_xray_port": 12345}, "uplink_tproxy_port"),
+    # The app publishes the Xray port on udp too.
+    ({"entry_xray_port": 51470}, "entry_awg_port"),
+    ({"vault_entry_xray": None}, "vault_entry_xray"),
+    ({"vault_entry_xray": {"uuid": "u", "private_key": "p", "public_key": "k"}},
+     "vault_entry_xray"),
+])
+def test_entry_xray_port_collision_refused(extra, var):
+    proc, fatal = _entry_xray_checks(extra)
+    assert proc.returncode != 0
+    assert len(fatal) == 1, proc.stdout
+    assert var in fatal[0]["msg"], fatal[0]["msg"]
+    if var == "vault_entry_xray":
+        assert "gen-secrets.py xray" in fatal[0]["msg"]
+
+
+def test_entry_play_applies_entry_xray_after_entry_app():
+    (play,) = _plays("playbooks/entry.yml")
+    names = [t["ansible.builtin.import_role"]["name"] for _, t in _flat_tasks([play])
+             if "ansible.builtin.import_role" in t]
+    assert names.index("entry_xray") == names.index("entry_app") + 1
+    task = next(t for _, t in _flat_tasks([play])
+                if t.get("ansible.builtin.import_role", {}).get("name") == "entry_xray")
+    assert task["when"] == "entry_xray_enabled | bool"
+
+
+def test_entry_xray_container_matches_run_container_sh():
+    tasks = _tasks_by_name("roles/entry_xray/tasks/main.yml")
+    c = tasks["Run the Xray container"]["community.docker.docker_container"]
+    assert c["name"] == c["image"] == "{{ entry_xray_container }}"
+    assert c["privileged"] is True and c["capabilities"] == ["NET_ADMIN"]
+    assert c["restart_policy"] == "always" and c["log_driver"] == "none"
+    assert c["published_ports"] == ["{{ entry_xray_port }}:{{ entry_xray_port }}/tcp",
+                                    "{{ entry_xray_port }}:{{ entry_xray_port }}/udp"]
+    assert c["volumes"] == ["{{ entry_xray_state_dir }}:/opt/amnezia/xray"]
+    assert c["networks"] == [{"name": "bridge"}, {"name": "{{ entry_app_network }}"}]
+    assert c["sysctls"] == {
+        "net.ipv4.tcp_congestion_control": "bbr",
+        "net.ipv4.ip_local_port_range": "{{ entry_awg_port | int | xray_port_range }}"}
+    tun = tasks["Create /dev/net/tun in the Xray container"]["community.docker.docker_container_exec"]
+    assert "mknod /dev/net/tun c 10 200" in tun["argv"][-1]
+    build = tasks["Build the Xray image"]["community.docker.docker_image"]
+    assert build["build"]["labels"] == {"org.multihop.build": "{{ entry_xray_build_id | trim }}"}
+    assert "entry_xray_image_build_label" in build["force_source"]
+
+
+def test_entry_xray_drift_checks_want_our_bind_mount():
+    # The app's own install mounts the named volume amnezia-xray-data at the
+    # same path, so the destination alone does not prove the container is ours.
+    tasks = _tasks_by_name("roles/entry_xray/tasks/main.yml")
+    for name in ("Assert the Xray container still has the state bind mount",
+                 "Assert the Xray container has the state bind mount"):
+        that = _dump(tasks[name]["ansible.builtin.assert"]["that"])
+        assert "/opt/amnezia/xray" in that and "'bind'" in that
+        assert "entry_xray_state_dir" in that

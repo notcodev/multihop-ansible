@@ -1,0 +1,194 @@
+---
+# amnezia-xray, run as client/server_scripts/xray/run_container.sh of the
+# Amnezia app 5.1.0.6 does, so the app adopts and manages it, with one
+# difference: the state is a host bind mount instead of the named volume
+# amnezia-xray-data (backups, drift detection). Mirrors roles/entry_app.
+- name: Check the Xray settings
+  ansible.builtin.import_tasks: checks.yml
+
+# The drift check must see our bind mount, not just something at
+# /opt/amnezia/xray: the app's own install puts the named volume there.
+- name: Look up the Xray container
+  community.docker.docker_container_info:
+    name: "{{ entry_xray_container }}"
+  register: entry_xray_pre_info
+  tags: [entry_xray_drift_check]
+
+# Pre-check: if the app (or anyone) re-created the container without the bind
+# mount, fail before touching anything. Skipped during an explicit restore,
+# which is the recovery path and re-creates the container with the mount.
+- name: Assert the Xray container still has the state bind mount
+  ansible.builtin.assert:
+    that: >-
+      (entry_xray_pre_info.container.Mounts | default([])
+       | selectattr('Destination', 'equalto', '/opt/amnezia/xray')
+       | selectattr('Type', 'equalto', 'bind')
+       | selectattr('Source', 'equalto', entry_xray_state_dir) | list | length) > 0
+    fail_msg: "{{ entry_xray_drift_msg }}"
+    quiet: true
+  when:
+    - entry_xray_pre_info.exists
+    - entry_xray_restore_dir | length == 0
+  tags: [entry_xray_drift_check]
+  vars:
+    entry_xray_drift_msg: >-
+      {{ entry_xray_container }} has no bind mount of {{ entry_xray_state_dir }} at
+      /opt/amnezia/xray (the Amnezia app probably re-installed it on a named volume).
+      User state is gone from the container; recover it by running
+      playbooks/restore.yml with a backup archive.
+
+- name: Restore state from backup
+  ansible.builtin.include_tasks: restore.yml
+  when: entry_xray_restore_dir | length > 0
+
+# Seed files are written only when server.json is absent. Once the app owns
+# them (users added, clientsTable created) they are never touched again.
+- name: Seed state files on first deploy
+  tags: [entry_xray_seed]
+  block:
+    - name: Create Xray state directory
+      ansible.builtin.file:
+        path: "{{ entry_xray_state_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Check for existing server.json
+      ansible.builtin.stat:
+        path: "{{ entry_xray_state_dir }}/server.json"
+      register: entry_xray_conf_stat
+
+    # Keys first: the app's configure_container.sh would generate any that are
+    # missing, which would not match the seeded server.json.
+    - name: Seed Xray key files
+      ansible.builtin.copy:
+        content: "{{ item.value }}\n"
+        dest: "{{ entry_xray_state_dir }}/{{ item.file }}"
+        mode: "0600"
+      when: not entry_xray_conf_stat.stat.exists
+      no_log: true
+      loop:
+        - { file: xray_uuid.key, value: "{{ vault_entry_xray.uuid }}" }
+        - { file: xray_private.key, value: "{{ vault_entry_xray.private_key }}" }
+        - { file: xray_public.key, value: "{{ vault_entry_xray.public_key }}" }
+        - { file: xray_short_id.key, value: "{{ vault_entry_xray.short_id }}" }
+
+    - name: Seed server.json
+      ansible.builtin.template:
+        src: server.json.j2
+        dest: "{{ entry_xray_state_dir }}/server.json"
+        mode: "0600"
+      when: not entry_xray_conf_stat.stat.exists
+      no_log: true
+      register: entry_xray_seeded
+
+- name: Create Xray image build directory
+  ansible.builtin.file:
+    path: "{{ entry_xray_build_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Stage Xray Dockerfile
+  ansible.builtin.copy:
+    src: Dockerfile
+    dest: "{{ entry_xray_build_dir }}/Dockerfile"
+    mode: "0644"
+
+- name: Stage Xray start.sh
+  ansible.builtin.template:
+    src: start.sh.j2
+    dest: "{{ entry_xray_build_dir }}/start.sh"
+    mode: "0755"
+
+- name: Checksum the staged Xray build context
+  ansible.builtin.stat:
+    path: "{{ entry_xray_build_dir }}/{{ item }}"
+    checksum_algorithm: sha256
+  loop: [Dockerfile, start.sh]
+  register: entry_xray_context
+
+- name: Inspect the current Xray image
+  community.docker.docker_image_info:
+    name: "{{ entry_xray_container }}"
+  register: entry_xray_image_info
+
+# Our build is identified by a label over its inputs, as in entry_app. An
+# image without it (or with another value) was not built from this context,
+# e.g. the app rebuilt amnezia-xray from upstream on a reinstall: rebuild it,
+# and the container below is recreated from our image. The Dockerfile pins the
+# Xray release, so the context alone identifies the build (the base image tag
+# is not pinned upstream, and is not part of the id).
+- name: Decide whether the Xray image must be built
+  ansible.builtin.set_fact:
+    entry_xray_build_id: >-
+      {{ entry_xray_context.results | map(attribute='stat.checksum') | join(':') | hash('sha256') }}
+    entry_xray_image_build_label: >-
+      {{ (((entry_xray_image_info.images | first | default({})).Config | default({})).Labels | default({}, true))
+         ['org.multihop.build'] | default('') }}
+
+- name: Build the Xray image
+  community.docker.docker_image:
+    name: "{{ entry_xray_container }}"
+    source: build
+    force_source: "{{ entry_xray_image_build_label | trim != entry_xray_build_id | trim }}"
+    build:
+      path: "{{ entry_xray_build_dir }}"
+      pull: false
+      labels:
+        org.multihop.build: "{{ entry_xray_build_id | trim }}"
+
+# The source-port range excludes entry_awg_port (same rule as entry_app's UDP
+# masquerade), so no Xray user flow leaves with the AWG server's port.
+- name: Run the Xray container
+  community.docker.docker_container:
+    name: "{{ entry_xray_container }}"
+    image: "{{ entry_xray_container }}"
+    state: started
+    # start.sh runs xray only if server.json exists: pick up a fresh seed.
+    restart: "{{ entry_xray_seeded is defined and entry_xray_seeded is changed }}"
+    restart_policy: always
+    privileged: true
+    capabilities:
+      - NET_ADMIN
+    log_driver: none
+    published_ports:
+      - "{{ entry_xray_port }}:{{ entry_xray_port }}/tcp"
+      - "{{ entry_xray_port }}:{{ entry_xray_port }}/udp"
+    sysctls:
+      net.ipv4.tcp_congestion_control: bbr
+      net.ipv4.ip_local_port_range: "{{ entry_awg_port | int | xray_port_range }}"
+    volumes:
+      - "{{ entry_xray_state_dir }}:/opt/amnezia/xray"
+    # entry_app creates the app network and runs before this role.
+    networks:
+      - name: bridge
+      - name: "{{ entry_app_network }}"
+
+- name: Create /dev/net/tun in the Xray container
+  community.docker.docker_container_exec:
+    container: "{{ entry_xray_container }}"
+    argv:
+      - bash
+      - -c
+      - mkdir -p /dev/net; if [ ! -c /dev/net/tun ]; then mknod /dev/net/tun c 10 200; echo created; fi
+  register: entry_xray_tun
+  changed_when: "'created' in entry_xray_tun.stdout"
+
+- name: Inspect the Xray container
+  community.docker.docker_container_info:
+    name: "{{ entry_xray_container }}"
+  register: entry_xray_post_info
+  tags: [entry_xray_drift_check]
+
+- name: Assert the Xray container has the state bind mount
+  ansible.builtin.assert:
+    that: >-
+      (entry_xray_post_info.container.Mounts | default([])
+       | selectattr('Destination', 'equalto', '/opt/amnezia/xray')
+       | selectattr('Type', 'equalto', 'bind')
+       | selectattr('Source', 'equalto', entry_xray_state_dir) | list | length) > 0
+    fail_msg: >-
+      {{ entry_xray_container }} has no bind mount of {{ entry_xray_state_dir }} at
+      /opt/amnezia/xray. Recover user state by running playbooks/restore.yml with a
+      backup archive.
+    quiet: true
+  tags: [entry_xray_drift_check]

@@ -8,6 +8,7 @@
       - vars[assert_vault_var] is mapping
       - >-
         assert_vault_keys
+        | select('in', vars[assert_vault_var])
         | map('extract', vars[assert_vault_var])
         | select('string') | select | list | length == assert_vault_keys | length
     fail_msg: >-

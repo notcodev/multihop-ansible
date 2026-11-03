@@ -1,0 +1,29 @@
+{#- What the Amnezia app (5.1.0.6) writes for its default Xray settings:
+    XrayServerConfig::toServerInboundJson in
+    client/core/models/protocols/xrayProtocolConfig.cpp, with transport raw,
+    security reality, flow xtls-rprx-vision. The server's own UUID is the only
+    client. Serialised like QJsonDocument::toJson(): sorted keys, 4-space
+    indent, trailing newline. -#}
+{%- set _server = {
+  'log': {'loglevel': 'error'},
+  'inbounds': [{
+    'port': entry_xray_port | int,
+    'protocol': 'vless',
+    'settings': {
+      'clients': [{'id': vault_entry_xray.uuid, 'flow': 'xtls-rprx-vision'}],
+      'decryption': 'none',
+    },
+    'streamSettings': {
+      'network': 'tcp',
+      'security': 'reality',
+      'realitySettings': {
+        'dest': entry_xray_site ~ ':443',
+        'privateKey': vault_entry_xray.private_key,
+        'serverNames': [entry_xray_site],
+        'shortIds': [vault_entry_xray.short_id],
+      },
+    },
+  }],
+  'outbounds': [{'protocol': 'freedom'}],
+} -%}
+{{ _server | to_nice_json(indent=4, sort_keys=True) }}
