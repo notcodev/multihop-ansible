@@ -1,0 +1,28 @@
+---
+# Refuse settings that cannot work before anything is changed on the host.
+- name: Check REALITY vault values
+  when: uplink_transport == 'reality'
+  block:
+    - name: Check vault_link_reality
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_link_reality
+        assert_vault_keys: [private_key, public_key, short_id]
+        assert_vault_hint: uv run scripts/gen-secrets.py xray
+
+    - name: Check vault_uplink_entry reality_uuid
+      ansible.builtin.include_tasks: ../../common/tasks/assert-vault.yml
+      vars:
+        assert_vault_var: vault_uplink_entry
+        assert_vault_keys: [reality_uuid]
+        # Rotating also changes the AWG uplink key: deploy the exit, then the entry.
+        assert_vault_hint: uv run scripts/gen-secrets.py uplink-key > <inventory>/group_vars/all/vault_uplink.yml
+
+- name: Refuse an uplink_tproxy_port that collides with ssh_port (reality mode)
+  ansible.builtin.assert:
+    that: uplink_tproxy_port | int != ssh_port | int
+    fail_msg: >-
+      uplink_tproxy_port {{ uplink_tproxy_port }} collides with ssh_port ({{ ssh_port }}):
+      the entry Xray's TPROXY port would take sshd's port. Pick another uplink_tproxy_port.
+    quiet: true
+  when: uplink_transport == 'reality'

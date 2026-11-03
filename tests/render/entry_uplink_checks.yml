@@ -1,0 +1,10 @@
+---
+- name: Exercise entry_uplink/tasks/checks.yml
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Run the entry_uplink checks
+      ansible.builtin.import_role:
+        name: entry_uplink
+        tasks_from: checks

@@ -1,0 +1,10 @@
+---
+- name: Exercise exit/tasks/checks.yml
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Run the exit checks
+      ansible.builtin.import_role:
+        name: exit
+        tasks_from: checks

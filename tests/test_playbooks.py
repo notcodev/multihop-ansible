@@ -540,6 +540,48 @@ def test_entry_xray_port_collision_refused(extra, var):
         assert "gen-secrets.py xray" in fatal[0]["msg"]
 
 
+def _role_checks(role, extra):
+    fx = yaml.safe_load((ROOT / "tests" / "render" / "fixture_vars.yml").read_text())
+    args = {k: fx[k] for k in ("ssh_port", "vault_link_reality", "vault_uplink_entry")}
+    args["uplink_transport"] = "reality"
+    args.update(extra)
+    proc = subprocess.run(
+        ["ansible-playbook", "-i", "localhost,", "-e", "ansible_connection=local",
+         str(ROOT / "tests" / "render" / f"{role}_checks.yml"), "-e", json.dumps(args)],
+        cwd=ROOT, env=_env(), capture_output=True, text=True)
+    fatal = [json.loads(ln.split("=> ", 1)[1]) for ln in proc.stdout.splitlines()
+             if ln.startswith(("fatal: [localhost]", "failed: [localhost]"))]
+    return proc, fatal
+
+
+@pytest.mark.parametrize("role", ["exit", "entry_uplink"])
+def test_reality_port_checks_pass_with_fixture_values(role):
+    proc, fatal = _role_checks(role, {})
+    assert proc.returncode == 0 and not fatal, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("role, extra, var", [
+    ("exit", {"exit_reality_port": 22}, "exit_reality_port"),
+    ("entry_uplink", {"uplink_tproxy_port": 22}, "uplink_tproxy_port"),
+    # regardless of entry_xray_enabled (entry_xray's own check covers only that case)
+    ("entry_uplink", {"uplink_tproxy_port": 22, "entry_xray_enabled": False}, "uplink_tproxy_port"),
+])
+def test_reality_port_colliding_with_ssh_refused(role, extra, var):
+    proc, fatal = _role_checks(role, extra)
+    assert proc.returncode != 0
+    assert len(fatal) == 1, proc.stdout
+    assert var in fatal[0]["msg"] and "ssh_port" in fatal[0]["msg"], fatal[0]["msg"]
+
+
+@pytest.mark.parametrize("role, extra", [
+    ("exit", {"exit_reality_port": 22}),
+    ("entry_uplink", {"uplink_tproxy_port": 22}),
+])
+def test_reality_port_checks_only_in_reality_mode(role, extra):
+    proc, fatal = _role_checks(role, {**extra, "uplink_transport": "awg"})
+    assert proc.returncode == 0 and not fatal, proc.stdout + proc.stderr
+
+
 def test_entry_play_applies_entry_xray_after_entry_app():
     (play,) = _plays("playbooks/entry.yml")
     names = [t["ansible.builtin.import_role"]["name"] for _, t in _flat_tasks([play])
