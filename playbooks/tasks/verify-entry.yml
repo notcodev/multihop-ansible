@@ -56,6 +56,30 @@
 
 - name: Wait for a fresh uplink handshake
   ansible.builtin.import_tasks: wait-handshake.yml
+  when: uplink_transport | default('awg') != 'reality'
+
+- name: Inspect the Xray uplink
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      echo "running=$(docker inspect -f '{{ '{{.State.Running}}' }}' multihop-uplink-xray)"
+      echo "listeners=$(ss -Hltn sport = :{{ uplink_tproxy_port }} | wc -l)"
+    executable: /bin/bash
+  register: verify_xray
+  changed_when: false
+  failed_when: false
+  when: uplink_transport | default('awg') == 'reality'
+
+- name: Assert the Xray uplink runs and listens on the TPROXY port
+  ansible.builtin.assert:
+    that:
+      - "'running=true' in verify_xray.stdout_lines"
+      - verify_xray.stdout is search('(?m)^listeners=[1-9]')
+    fail_msg: >-
+      multihop-uplink-xray is not running or nothing listens on TCP {{ uplink_tproxy_port }}
+      ({{ verify_xray.stdout_lines | default([]) | join(', ') }} {{ verify_xray.stderr | default('') | trim }}).
+    quiet: true
+  when: uplink_transport | default('awg') == 'reality'
 
 - name: Check egress through the exit
   vars:
@@ -72,6 +96,7 @@
       register: verify_exit_bytes_before
       changed_when: false
       delegate_to: "{{ _verify_exit_host }}"
+      when: uplink_transport | default('awg') != 'reality'
 
     - name: Ask the IP echo service from inside amnezia-awg2
       ansible.builtin.command:
@@ -95,6 +120,7 @@
       register: verify_exit_bytes_after
       changed_when: false
       delegate_to: "{{ _verify_exit_host }}"
+      when: uplink_transport | default('awg') != 'reality'
 
     - name: Assert the request went through the exit tunnel
       ansible.builtin.assert:
@@ -104,6 +130,63 @@
           ({{ verify_exit_bytes_before.stdout }} -> {{ verify_exit_bytes_after.stdout }})
           while amnezia-awg2 fetched {{ verify_ip_echo_url | default('https://api.ipify.org') }}.
         quiet: true
+      when: uplink_transport | default('awg') != 'reality'
+
+    - name: Find the entry's own IPv4 (the source address towards the exit)
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          ip -4 route get {{ hostvars[_verify_exit_host].ansible_default_ipv4.address }}
+          | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+        executable: /bin/bash
+      register: verify_entry_ipv4
+      changed_when: false
+      when: uplink_transport | default('awg') == 'reality'
+
+    - name: Look for an established connection from the entry on the exit's REALITY port
+      ansible.builtin.shell:
+        cmd: ss -Htn state established sport = :{{ exit_reality_port }} dst {{ verify_entry_ipv4.stdout | trim }}
+        executable: /bin/bash
+      register: verify_exit_conn
+      changed_when: false
+      delegate_to: "{{ _verify_exit_host }}"
+      when: uplink_transport | default('awg') == 'reality'
+
+    - name: Assert the exit has a REALITY connection from the entry
+      ansible.builtin.assert:
+        that: verify_exit_conn.stdout | trim | length > 0
+        fail_msg: >-
+          No established TCP connection from the entry ({{ verify_entry_ipv4.stdout | default('') | trim }}) to
+          port {{ exit_reality_port }} on the exit: the request did not travel over REALITY.
+        quiet: true
+      when: uplink_transport | default('awg') == 'reality'
+
+    - name: Ask the IP echo service from inside amnezia-xray
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - amnezia-xray
+          - curl
+          - "-4"
+          - "-s"
+          - --max-time
+          - "10"
+          - "{{ verify_ip_echo_url | default('https://api.ipify.org') }}"
+      register: verify_echo_xray
+      changed_when: false
+      when: entry_xray_enabled | default(false) | bool
+
+    - name: Assert amnezia-xray egresses with the exit's public IPv4
+      ansible.builtin.assert:
+        that: verify_echo_xray.stdout | trim == hostvars[_verify_exit_host].ansible_default_ipv4.address
+        fail_msg: >-
+          amnezia-xray egresses as '{{ verify_echo_xray.stdout | trim }}', expected the exit's
+          public IPv4 '{{ hostvars[_verify_exit_host].ansible_default_ipv4.address | default('unknown') }}'.
+        quiet: true
+      when:
+        - entry_xray_enabled | default(false) | bool
+        - verify_compare_ips | default(true) | bool
 
     - name: Assert the entry egresses with the exit's public IPv4
       ansible.builtin.assert:

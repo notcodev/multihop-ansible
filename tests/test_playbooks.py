@@ -316,3 +316,82 @@ def test_swap_entry_exit_push_applies_the_exit_plays_roles():
     for got, want in zip(push["roles"], exit_play["roles"]):
         assert got["when"] == cond
         assert {k: v for k, v in got.items() if k != "when"} == want
+
+
+def _plays(path):
+    return yaml.safe_load((ROOT / path).read_text())
+
+
+def _flat_tasks(plays):
+    """(play index, task) for every task, descending into blocks."""
+    def walk(tasks):
+        for t in tasks or []:
+            yield t
+            for key in ("block", "rescue", "always"):
+                yield from walk(t.get(key))
+    for i, play in enumerate(plays):
+        for t in walk(play.get("tasks")):
+            yield i, t
+
+
+def _dump(task):
+    return yaml.safe_dump(task)
+
+
+def test_swap_exit_flushes_entry_resolver():
+    plays = _plays("playbooks/swap-exit.yml")
+    dns = next(i for i, p in enumerate(plays) if p.get("name") == "Point the exit DNS record at the new exit")
+    hits = [(i, t) for i, t in _flat_tasks(plays) if "resolvectl flush-caches" in _dump(t)]
+    assert hits
+    i, task = hits[0]
+    assert i > dns
+    assert plays[i]["hosts"] == "entry"
+    assert task["failed_when"] is False and task["changed_when"] is False
+
+
+def test_swap_exit_awg_stops_old_before_handshake_wait():
+    plays = _plays("playbooks/swap-exit.yml")
+    flat = list(_flat_tasks(plays))
+    stop = next(n for n, (i, t) in enumerate(flat)
+                if "community.docker.docker_container" in t
+                and t["community.docker.docker_container"].get("name") == "multihop-exit"
+                and plays[i]["hosts"] == "exit_old")
+    wait = next(n for n, (i, t) in enumerate(flat) if "wait-handshake.yml" in _dump(t))
+    assert stop < wait
+    task = flat[stop][1]
+    assert task["community.docker.docker_container"]["state"] == "stopped"
+    assert "stop_old" in task["community.docker.docker_container"]["restart_policy"]
+    assert "uplink_transport" in task["when"]
+
+
+def test_swap_exit_reality_restarts_uplink_xray_and_waits_for_connection():
+    plays = _plays("playbooks/swap-exit.yml")
+    flat = list(_flat_tasks(plays))
+    restart = next(n for n, (i, t) in enumerate(flat)
+                   if "multihop-uplink-xray" in _dump(t) and "docker_container" in _dump(t)
+                   and t.get("community.docker.docker_container", {}).get("state") == "started")
+    task = flat[restart][1]
+    assert task["community.docker.docker_container"]["restart"] is True
+    assert "reality" in task["when"]
+    wait = next(n for n, (i, t) in enumerate(flat) if "state established" in _dump(t))
+    assert wait > restart
+    w = flat[wait][1]
+    assert "exit_reality_port" in _dump(w) and "reality" in w["when"]
+    assert w["until"] and w["retries"] == 30 and w["delay"] == 10
+    assert "curl" in _dump(w) and "amnezia-awg2" in _dump(w)
+    # no handshake wait runs in reality mode
+    for n, (i, t) in enumerate(flat):
+        if "wait-handshake.yml" in _dump(t):
+            assert "!= 'reality'" in str(t.get("when", "")) or "== 'awg'" in str(t.get("when", ""))
+
+
+def test_verify_fail_closed_stops_uplink_xray_in_reality_mode():
+    plays = _plays("playbooks/verify.yml")
+    block = next(t for _, t in _flat_tasks(plays) if t.get("tags") == ["fail_closed"])
+    container = block["vars"]["_fc_container"]
+    assert "'multihop-uplink-xray' if uplink_transport | default('awg') == 'reality'" in container
+    assert container.endswith("else 'multihop-uplink' }}")
+    stop = [t for t in block["block"] if "docker_container" in _dump(t)]
+    start = [t for t in block["always"] if "docker_container" in _dump(t)]
+    assert stop[0]["community.docker.docker_container"] == {"name": "{{ _fc_container }}", "state": "stopped"}
+    assert start[0]["community.docker.docker_container"] == {"name": "{{ _fc_container }}", "state": "started"}
