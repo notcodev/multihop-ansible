@@ -320,11 +320,7 @@ wait_uplink() { # [awg|reality]: until the uplink is up (awg: handshake younger 
   return 1
 }
 
-exit_bytes() { # total awg-exit transfer on the current exit (reality: bytes sent on its public interface)
-  if reality; then
-    on "$1" '. /etc/multihop/multihop.env && cat /sys/class/net/$PUBLIC_IFACE/statistics/tx_bytes'
-    return
-  fi
+exit_bytes() { # total awg-exit transfer on the current exit (awg mode only: in reality mode awg-exit carries nothing)
   on "$1" "docker exec multihop-exit awg show awg-exit transfer | awk '{ s += \$2 + \$3 } END { print s + 0 }'"
 }
 
@@ -457,16 +453,28 @@ ck_peer_kept() { # brief 3.2 / Review Focus 1
 }
 
 ck_client_via_exit() {
-  local b a ip
-  b=$(exit_bytes "$EXIT_NOW")
-  ip=$(client_curl https://api.ipify.org)
-  a=$(exit_bytes "$EXIT_NOW")
+  local b a ip ev ok=0
   local note=""
   [ "$CLIENT_IP" = "$EXIT_NOW" ] && note=" (client host IS the exit: the IP match alone does not discriminate)"
-  if [ "$ip" = "$EXIT_NOW" ] && [ "$a" -gt "$b" ]; then
-    result PASS client_via_exit "client egress IP $ip (= exit, client host $CLIENT_IP)$note; awg-exit bytes $b -> $a"
+  if reality; then
+    # awg-exit carries nothing in reality mode (and any byte counter on the
+    # exit's public interface always grows): the second evidence is the
+    # entry's established connection to the exit's REALITY port.
+    ip=$(client_curl https://api.ipify.org)
+    a=$(uplink_conn "$EXIT_NOW")
+    ev="entry -> $EXIT_NOW:$(RPORT) established TCP: ${a:-?}"
+    [ "$ip" = "$EXIT_NOW" ] && [ "${a:-0}" -ge 1 ] 2>/dev/null && ok=1
   else
-    result FAIL client_via_exit "client egress '$ip' (exit $EXIT_NOW); awg-exit bytes $b -> $a"
+    b=$(exit_bytes "$EXIT_NOW")
+    ip=$(client_curl https://api.ipify.org)
+    a=$(exit_bytes "$EXIT_NOW")
+    ev="awg-exit bytes $b -> $a"
+    [ "$ip" = "$EXIT_NOW" ] && [ "$a" -gt "$b" ] && ok=1
+  fi
+  if [ "$ok" = 1 ]; then
+    result PASS client_via_exit "client egress IP $ip (= exit, client host $CLIENT_IP)$note; $ev"
+  else
+    result FAIL client_via_exit "client egress '$ip' (exit $EXIT_NOW); $ev"
   fi
 }
 
@@ -785,14 +793,21 @@ need_reality() { # need_reality <check>: SKIP unless the lab runs the Xray uplin
 
 ck_reality_uplink() {
   need_reality reality_uplink || return
-  local ip lst conn
+  local ip lst own conn
   ip=$(client_curl https://api.ipify.org)
   lst=$(on "$ENTRY_IP" "ss -ltnH 'sport = :$(TPORT)'" | awk '{print $4}' | paste -sd' ' -)
+  # Every listener on the TPROXY port must be a process of multihop-uplink-xray
+  # (its cgroup names the container), not some other host socket.
+  own=$(on "$ENTRY_IP" "cid=\$(docker inspect -f '{{.Id}}' multihop-uplink-xray) || exit 1
+    for p in \$(ss -ltnpH 'sport = :$(TPORT)' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+      if grep -q \"\$cid\" /proc/\$p/cgroup; then echo \"own:\$p\"; else echo \"other:\$p\"; fi
+    done" | paste -sd' ' -)
   conn=$(uplink_conn "$EXIT_NOW")
-  if [ -n "$lst" ] && [ "${conn:-0}" -ge 1 ] 2>/dev/null && [ "$ip" = "$EXIT_NOW" ]; then
-    result PASS reality_uplink "multihop-uplink-xray listens on $lst; $conn established TCP to $EXIT_NOW:$(RPORT); AWG client egress $ip (= exit)"
+  if [ -n "$lst" ] && [[ "$own" == *own:* ]] && [[ "$own" != *other:* ]] \
+     && [ "${conn:-0}" -ge 1 ] 2>/dev/null && [ "$ip" = "$EXIT_NOW" ]; then
+    result PASS reality_uplink "multihop-uplink-xray listens on $lst (listener pids $own, in its cgroup); $conn established TCP to $EXIT_NOW:$(RPORT); AWG client egress $ip (= exit)"
   else
-    result FAIL reality_uplink "listen '$lst'; established to $EXIT_NOW:$(RPORT) = '$conn'; AWG client egress '$ip' (exit $EXIT_NOW)"
+    result FAIL reality_uplink "listen '$lst' (pids '$own'); established to $EXIT_NOW:$(RPORT) = '$conn'; AWG client egress '$ip' (exit $EXIT_NOW)"
   fi
 }
 
@@ -905,6 +920,7 @@ ck_direct_and_force_exit_reality() { # lab: 1.0.0.0/24 direct; 1.1.1.1/32 forced
 }
 
 ck_xray_client_via_exit() {
+  [ "$(invvar entry_xray_enabled false)" = true ] || { result SKIP xray_client_via_exit "entry_xray_enabled is not true"; return; }
   local ip dip ok=0 added
   # Adds the user like the app: server.json append + docker restart amnezia-xray.
   ap lab-xray tests/integration/lab.yml --tags xray || { result FAIL xray_client_via_exit "lab.yml (xray) failed, see $LOGS/lab-xray.log"; return; }
@@ -926,7 +942,7 @@ ck_xray_client_via_exit() {
 
 ck_xray_restart_keeps_settings() { # Review Focus 5: the settings the app's run script does not give a restarted container
   [ "$(invvar entry_xray_enabled false)" = true ] || { result SKIP xray_restart_keeps_settings "entry_xray_enabled is not true"; return; }
-  local mount range lo hi cc dl
+  local mount range lo hi cc dl ns_cc host_cc
   xray_client_up || { result FAIL xray_restart_keeps_settings "the Xray client gets no traffic before the restart"; return; }
   on "$ENTRY_IP" 'docker restart amnezia-xray >/dev/null'
   xray_client_up
@@ -939,11 +955,17 @@ ck_xray_restart_keeps_settings() { # Review Focus 5: the settings the app's run 
   sleep 5
   cc=$(on "$ENTRY_IP" 'pid=$(docker inspect -f "{{.State.Pid}}" amnezia-xray); nsenter -t "$pid" -n ss -tin state established | grep -c bbr')
   kill "$dl" 2>/dev/null; wait "$dl" 2>/dev/null
+  # The host default is bbr too (common role), so bbr on a connection alone
+  # does not show the container's own setting: read its netns sysctl
+  # explicitly, next to the host's.
+  ns_cc=$(on "$ENTRY_IP" 'pid=$(docker inspect -f "{{.State.Pid}}" amnezia-xray); nsenter -t "$pid" -n sysctl -n net.ipv4.tcp_congestion_control')
+  host_cc=$(on "$ENTRY_IP" 'sysctl -n net.ipv4.tcp_congestion_control')
   if [[ "$mount" == *"bind:/var/lib/multihop/entry-xray:/opt/amnezia/xray"* ]] \
-     && [ -n "$lo" ] && { [ "$(P)" -lt "$lo" ] || [ "$(P)" -gt "$hi" ]; } && [ "${cc:-0}" -ge 1 ] 2>/dev/null; then
-    result PASS xray_restart_keeps_settings "after docker restart amnezia-xray: mounts '${mount% }'; ip_local_port_range '$lo $hi' excludes entry_awg_port $(P); $cc established connection(s) with bbr"
+     && [ -n "$lo" ] && { [ "$(P)" -lt "$lo" ] || [ "$(P)" -gt "$hi" ]; } && [ "${cc:-0}" -ge 1 ] 2>/dev/null \
+     && [ "$ns_cc" = bbr ]; then
+    result PASS xray_restart_keeps_settings "after docker restart amnezia-xray: mounts '${mount% }'; ip_local_port_range '$lo $hi' excludes entry_awg_port $(P); container netns tcp_congestion_control=$ns_cc (host: $host_cc), $cc established connection(s) with bbr"
   else
-    result FAIL xray_restart_keeps_settings "mounts '$mount'; ip_local_port_range '$range' (entry_awg_port $(P)); bbr connections=$cc"
+    result FAIL xray_restart_keeps_settings "mounts '$mount'; ip_local_port_range '$range' (entry_awg_port $(P)); container netns tcp_congestion_control='$ns_cc' (host '$host_cc'); bbr connections=$cc"
   fi
 }
 
