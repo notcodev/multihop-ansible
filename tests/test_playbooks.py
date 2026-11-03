@@ -263,3 +263,16 @@ def test_exit_forwarding_comes_back_with_docker():
     tasks = _tasks_by_name("roles/exit/tasks/main.yml")
     dropin = tasks["Start multihop-net whenever Docker starts"]["ansible.builtin.copy"]
     assert dropin["dest"] == "/etc/systemd/system/docker.service.d/multihop.conf"
+
+
+def test_common_sets_bbr():
+    tasks = yaml.safe_load((ROOT / "roles/common/tasks/main.yml").read_text())
+    items = []
+    for t in tasks:
+        if "ansible.posix.sysctl" in t:
+            items += t["loop"]
+    assert {"key": "net.core.default_qdisc", "value": "fq"} in items
+    assert {"key": "net.ipv4.tcp_congestion_control", "value": "bbr"} in items
+    persist = [t for t in tasks
+               if t.get("ansible.builtin.copy", {}).get("dest") == "/etc/modules-load.d/multihop-bbr.conf"]
+    assert persist and "tcp_bbr" in persist[0]["ansible.builtin.copy"]["content"]

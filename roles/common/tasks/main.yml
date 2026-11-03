@@ -12,6 +12,19 @@
     enabled: true
     state: started
 
+- name: Load tcp_bbr
+  community.general.modprobe:
+    name: tcp_bbr
+    state: present
+
+- name: Load tcp_bbr on boot
+  ansible.builtin.copy:
+    content: "tcp_bbr\n"
+    dest: /etc/modules-load.d/multihop-bbr.conf
+    mode: "0644"
+    owner: root
+    group: root
+
 - name: Set sysctls
   ansible.posix.sysctl:
     name: "{{ item.key }}"
@@ -29,6 +42,8 @@
     # routes their source via the public interface) and are dropped silently.
     - { key: net.ipv4.conf.all.rp_filter, value: "2" }
     - { key: net.ipv4.conf.default.rp_filter, value: "2" }
+    - { key: net.core.default_qdisc, value: fq }
+    - { key: net.ipv4.tcp_congestion_control, value: bbr }
 
 - name: Create multihop config directory
   ansible.builtin.file:
@@ -90,6 +105,10 @@
         mode: "0644"
         owner: root
         group: root
+
+- name: Pin Xray image
+  ansible.builtin.include_tasks: xray-image.yml
+  when: uplink_transport | default('awg') == 'reality'
 
 # Own marker so blocks appended by later roles survive re-runs.
 - name: Write common keys to multihop.env

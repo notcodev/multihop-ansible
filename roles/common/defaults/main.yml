@@ -8,6 +8,10 @@ common_packages:
   - dnsutils
 common_base_image: amneziavpn/amneziawg-go
 common_base_image_tag: multihop/awg-base:pinned
+common_xray_image: ghcr.io/xtls/xray-core
+common_xray_image_tag: multihop/xray:pinned
 common_input_udp_ports: []
+common_input_tcp_ports: []
+uplink_transport: awg  # noqa: var-naming[no-role-prefix]
 extra_input_tcp_ports: []  # noqa: var-naming[no-role-prefix]
 public_iface: "{{ ansible_default_ipv4.interface }}"  # noqa: var-naming[no-role-prefix]

@@ -12,6 +12,8 @@ entry_awg_subnet: 10.8.1.0/24
 uplink_subnet: 10.9.0.0/30
 uplink_mtu: 1280
 awg_base_image_digest: sha256:cbafc02b8373a83f428272db6d8001b37bc02e6211cbd8c0cb4e2e3759b12b72
+# ghcr.io/xtls/xray-core release 26.10.31 (multi-arch OCI index digest)
+xray_image_digest: sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9
 
 # split routing
 split_routing_enabled: true

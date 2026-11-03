@@ -53,6 +53,12 @@ def test_input_udp_ports_from_common_input_udp_ports():
     assert 'INPUT_UDP_PORTS="51820 51821"' in text
 
 
+def test_input_tcp_ports_combines_common_and_extra():
+    text = render("roles/common/templates/multihop.env.j2", "multihop.env",
+                  {"common_input_tcp_ports": [443], "extra_input_tcp_ports": [8080]})
+    assert 'INPUT_TCP_PORTS="443 8080"' in text
+
+
 def _fixture():
     import yaml
     return yaml.safe_load((RENDER_DIR / "fixture_vars.yml").read_text())

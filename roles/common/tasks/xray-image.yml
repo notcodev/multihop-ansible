@@ -1,0 +1,43 @@
+---
+- name: Read applied Xray image digest marker
+  ansible.builtin.slurp:
+    src: /var/lib/multihop/xray.digest
+  register: common_xray_applied_digest
+  failed_when: false
+
+- name: Inspect pinned Xray image tag
+  community.docker.docker_image_info:
+    name: "{{ common_xray_image_tag }}"
+  register: common_xray_pinned_image
+
+- name: Pull, tag and untag pinned Xray image
+  when: >-
+    (common_xray_pinned_image.images | length == 0)
+    or (common_xray_applied_digest.content | default('') | b64decode | trim) != xray_image_digest
+  block:
+    - name: Pull pinned Xray image by digest
+      community.docker.docker_image:
+        name: "{{ common_xray_image }}@{{ xray_image_digest }}"
+        source: pull
+
+    - name: Tag Xray image locally
+      community.docker.docker_image_tag:
+        name: "{{ common_xray_image }}@{{ xray_image_digest }}"
+        repository: "{{ common_xray_image_tag }}"
+        existing_images: overwrite
+
+    # Same untag-only approach as the awg base image (see main.yml).
+    - name: Remove upstream Xray reference (untag only)
+      ansible.builtin.command:
+        argv: [docker, rmi, "{{ common_xray_image }}@{{ xray_image_digest }}"]
+      register: common_xray_untag
+      changed_when: "'Untagged' in common_xray_untag.stdout"
+      failed_when: common_xray_untag.rc != 0 and 'No such image' not in common_xray_untag.stderr
+
+    - name: Record applied Xray image digest
+      ansible.builtin.copy:
+        content: "{{ xray_image_digest }}\n"
+        dest: /var/lib/multihop/xray.digest
+        mode: "0644"
+        owner: root
+        group: root

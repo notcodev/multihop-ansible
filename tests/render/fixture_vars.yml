@@ -3,6 +3,7 @@
 inventory_hostname: fixture-host
 public_iface: eth0
 common_input_udp_ports: []
+common_input_tcp_ports: []
 extra_input_tcp_ports: []
 
 entry_domain: entry.example.com
