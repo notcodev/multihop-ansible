@@ -15,6 +15,18 @@ awg_base_image_digest: sha256:cbafc02b8373a83f428272db6d8001b37bc02e6211cbd8c0cb
 # ghcr.io/xtls/xray-core release 26.10.31 (multi-arch OCI index digest)
 xray_image_digest: sha256:ceabeac03a89d991d2a247361825c1d1d2e9c91cd5dc010f298c7dc0c2f325c9
 
+# uplink transport: awg (default) or reality (TPROXY into Xray, VLESS + REALITY
+# to the exit; needs vault_link_reality and reality_uuid, see the README)
+# uplink_transport: reality
+# exit_reality_port: 443
+# uplink_reality_site: dl.google.com
+# uplink_tproxy_port: 12345   # loopback only; not entry_xray_port, not SSH
+
+# the app's Xray server on the entry (needs vault_entry_xray)
+# entry_xray_enabled: true
+# entry_xray_port: 443        # cannot change after the first deploy
+# entry_xray_site: www.googletagmanager.com
+
 # split routing
 split_routing_enabled: true
 split_direct_countries: [ru]
