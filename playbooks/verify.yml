@@ -12,6 +12,8 @@
   hosts: entry
   become: true
   gather_facts: false
+  roles:
+    - multihop_defaults
   tasks:
     - name: Verify the uplink path
       ansible.builtin.import_tasks: tasks/verify-entry.yml
@@ -21,7 +23,7 @@
       when: (verify_fail_closed | default(false) | bool) or ('fail_closed' in ansible_run_tags)
       tags: [fail_closed]
       vars:
-        _fc_container: "{{ 'multihop-uplink-xray' if uplink_transport | default('awg') == 'reality' else 'multihop-uplink' }}"
+        _fc_container: "{{ 'multihop-uplink-xray' if uplink_transport == 'reality' else 'multihop-uplink' }}"
         _fc_url: "{{ verify_ip_echo_url | default('https://api.ipify.org') }}"
         _fc_host: "{{ _fc_url | urlsplit('hostname') }}"
         _fc_port: "{{ _fc_url | urlsplit('port') | default(443 if (_fc_url | urlsplit('scheme')) == 'https' else 80, true) }}"
@@ -75,7 +77,7 @@
 
         - name: Wait for the uplink to handshake again
           ansible.builtin.include_tasks: tasks/wait-handshake.yml
-          when: uplink_transport | default('awg') != 'reality'
+          when: uplink_transport != 'reality'
 
         - name: Wait for the TPROXY listener again
           ansible.builtin.command: ss -Hltn sport = :{{ uplink_tproxy_port }}
@@ -84,4 +86,4 @@
           retries: 12
           delay: 5
           changed_when: false
-          when: uplink_transport | default('awg') == 'reality'
+          when: uplink_transport == 'reality'

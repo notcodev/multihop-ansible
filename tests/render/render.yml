@@ -5,6 +5,7 @@
   gather_facts: false
   # Role defaults first (as in a real play), then fixture values on top.
   vars_files:
+    - ../../roles/multihop_defaults/defaults/main.yml
     - ../../roles/common/defaults/main.yml
     - fixture_vars.yml
   tasks:

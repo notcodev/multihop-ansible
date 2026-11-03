@@ -389,9 +389,52 @@ def test_verify_fail_closed_stops_uplink_xray_in_reality_mode():
     plays = _plays("playbooks/verify.yml")
     block = next(t for _, t in _flat_tasks(plays) if t.get("tags") == ["fail_closed"])
     container = block["vars"]["_fc_container"]
-    assert "'multihop-uplink-xray' if uplink_transport | default('awg') == 'reality'" in container
+    assert "'multihop-uplink-xray' if uplink_transport == 'reality'" in container
     assert container.endswith("else 'multihop-uplink' }}")
     stop = [t for t in block["block"] if "docker_container" in _dump(t)]
     start = [t for t in block["always"] if "docker_container" in _dump(t)]
     assert stop[0]["community.docker.docker_container"] == {"name": "{{ _fc_container }}", "state": "stopped"}
     assert start[0]["community.docker.docker_container"] == {"name": "{{ _fc_container }}", "state": "started"}
+
+
+SHARED_VARS = ("uplink_transport", "exit_reality_port", "uplink_reality_site",
+               "uplink_tproxy_port", "entry_xray_enabled", "entry_xray_port")
+
+
+def _role_applies_defaults(name, seen=()):
+    if name == "multihop_defaults":
+        return True
+    meta = ROOT / "roles" / name / "meta" / "main.yml"
+    if not meta.exists() or name in seen:
+        return False
+    deps = (yaml.safe_load(meta.read_text()) or {}).get("dependencies") or []
+    return any(_role_applies_defaults(d["role"] if isinstance(d, dict) else d, (*seen, name))
+               for d in deps)
+
+
+def _task_text(play):
+    """The play's own YAML plus every playbooks/tasks file it includes."""
+    text = yaml.safe_dump({k: v for k, v in play.items() if k not in ("roles", "import_playbook")})
+    for ref in __import__("re").findall(r"tasks/[\w.-]+\.yml", text):
+        text += (ROOT / "playbooks" / ref).read_text()
+    return text
+
+
+def test_plays_using_shared_vars_apply_multihop_defaults():
+    problems = []
+    for path in sorted((ROOT / "playbooks").glob("*.yml")):
+        for play in yaml.safe_load(path.read_text()):
+            if "import_playbook" in play:
+                continue
+            text = _task_text(play) + yaml.safe_dump(play.get("roles") or [])
+            if not any(v in text for v in SHARED_VARS):
+                continue
+            roles = [r["role"] if isinstance(r, dict) else r for r in play.get("roles") or []]
+            if not any(_role_applies_defaults(r) for r in roles):
+                problems.append(f"{path.name}: {play.get('name')}")
+    assert not problems, problems
+
+
+def test_roles_using_shared_vars_depend_on_multihop_defaults():
+    for role in ("common", "exit", "entry_uplink"):
+        assert _role_applies_defaults(role), role

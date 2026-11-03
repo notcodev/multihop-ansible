@@ -108,7 +108,7 @@
 
 - name: Pin Xray image
   ansible.builtin.include_tasks: xray-image.yml
-  when: uplink_transport | default('awg') == 'reality'
+  when: uplink_transport == 'reality'
 
 # Own marker so blocks appended by later roles survive re-runs.
 - name: Write common keys to multihop.env

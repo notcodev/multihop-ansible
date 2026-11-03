@@ -1,0 +1,15 @@
+---
+# Shared knobs read by several roles and playbooks. They live in a defaults-only
+# role (lowest precedence, so inventory vars win) that common, exit and
+# entry_uplink depend on; plays that use them without those roles list it.
+uplink_transport: awg  # noqa: var-naming[no-role-prefix]
+# REALITY uplink: the exit's TCP port and the site it imitates. Read by both
+# the exit (server) and the entry (client) templates.
+exit_reality_port: 443  # noqa: var-naming[no-role-prefix]
+uplink_reality_site: dl.google.com  # noqa: var-naming[no-role-prefix]
+# Loopback port of the entry Xray's TPROXY inbound (reality mode).
+uplink_tproxy_port: 12345  # noqa: var-naming[no-role-prefix]
+# The app's Xray server on the entry; when enabled, replies of connections to
+# entry_xray_port leave via the entry IP (multihop-entry-net).
+entry_xray_enabled: false  # noqa: var-naming[no-role-prefix]
+entry_xray_port: 443  # noqa: var-naming[no-role-prefix]

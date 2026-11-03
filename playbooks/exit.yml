@@ -3,6 +3,7 @@
   hosts: exit
   become: true
   roles:
+    - role: multihop_defaults
     - role: common
       vars:
         # The exit's AWG port must pass the INPUT firewall.

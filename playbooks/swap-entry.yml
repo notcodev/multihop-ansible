@@ -131,6 +131,8 @@
   # The same roles as playbooks/exit.yml (common supplies the defaults the exit
   # role needs and keeps the exit's AWG/REALITY ports open).
   roles:
+    - role: multihop_defaults
+      when: not _old_entry_reachable
     - role: common
       vars:
         common_input_udp_ports: ["{{ exit_awg_port }}"]

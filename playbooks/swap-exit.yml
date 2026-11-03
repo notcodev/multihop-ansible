@@ -54,13 +54,15 @@
   hosts: exit_old
   become: true
   gather_facts: false
+  roles:
+    - multihop_defaults
   tasks:
     - name: Stop multihop-exit on the old exit (and keep it stopped across reboots with stop_old)
       community.docker.docker_container:
         name: multihop-exit
         state: stopped
         restart_policy: "{{ 'no' if (stop_old | default(false) | bool) else omit }}"
-      when: uplink_transport | default('awg') != 'reality'
+      when: uplink_transport != 'reality'
 
 # reality mode: the entry's Xray follows the DNS change when restarted (it
 # resolves the exit domain at start). Generate traffic, then wait for an
@@ -76,6 +78,8 @@
   hosts: entry
   become: true
   gather_facts: false
+  roles:
+    - multihop_defaults
   vars:
     _new_exit_ip: "{{ hostvars[groups['exit'][0]]['ansible_host'] }}"
     _uplink_base: "{{ (uplink_subnet | split('/'))[0].split('.') }}"
@@ -85,17 +89,24 @@
         name: multihop-uplink-xray
         state: started
         restart: true
-      when: uplink_transport | default('awg') == 'reality'
+      when: uplink_transport == 'reality'
 
+    # Each client connection is its own short TCP connection to the exit, so
+    # every try holds one open with a slow download while it looks for it.
     - name: Wait up to 5 minutes for an established connection to the new exit
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
-          docker exec amnezia-awg2 curl -4 -s --max-time 5 "$ECHO_URL" > /dev/null || true
+          docker exec amnezia-awg2 curl -4 -s -o /dev/null --max-time 30 --limit-rate 20k "$SLOW_URL" &
+          pid=$!
+          sleep 3
           ss -Htn state established dst "$EXIT_IP" dport = :"$EXIT_PORT" | grep -q .
+          rc=$?
+          kill "$pid" 2>/dev/null || true
+          exit $rc
         executable: /bin/bash
       environment:
-        ECHO_URL: "{{ verify_ip_echo_url | default('https://api.ipify.org') }}"
+        SLOW_URL: "{{ verify_slow_download_url | default('https://speed.cloudflare.com/__down?bytes=2000000') }}"
         EXIT_IP: "{{ _new_exit_ip }}"
         EXIT_PORT: "{{ exit_reality_port }}"
       register: swap_exit_reality_conn
@@ -103,7 +114,7 @@
       retries: 30
       delay: 10
       changed_when: false
-      when: uplink_transport | default('awg') == 'reality'
+      when: uplink_transport == 'reality'
 
     - name: Wait up to 5 minutes until the uplink endpoint is the new exit
       ansible.builtin.shell:
@@ -120,7 +131,7 @@
       retries: 30
       delay: 10
       changed_when: false
-      when: uplink_transport | default('awg') != 'reality'
+      when: uplink_transport != 'reality'
 
     - name: Force and wait for a handshake with the new exit (one rekey interval at most)
       ansible.builtin.include_tasks: tasks/wait-handshake.yml
@@ -129,12 +140,14 @@
         wait_handshake_since: "{{ swap_exit_flip.stdout | trim }}"
         wait_handshake_kick: "{{ _uplink_base[:3] | join('.') }}.{{ (_uplink_base[3] | int) + 1 }}"
         wait_handshake_retries: 20
-      when: uplink_transport | default('awg') != 'reality'
+      when: uplink_transport != 'reality'
 
 - name: Confirm the new exit has a session with the entry
   hosts: exit
   become: true
   gather_facts: false
+  roles:
+    - multihop_defaults
   tasks:
     - name: Wait for a fresh handshake on awg-exit
       ansible.builtin.include_tasks: tasks/wait-handshake.yml
@@ -142,7 +155,7 @@
         wait_handshake_container: multihop-exit
         wait_handshake_iface: awg-exit
         wait_handshake_retries: 20
-      when: uplink_transport | default('awg') != 'reality'
+      when: uplink_transport != 'reality'
 
 - name: Verify
   ansible.builtin.import_playbook: verify.yml
@@ -151,6 +164,8 @@
   hosts: exit_old
   become: true
   gather_facts: false
+  roles:
+    - multihop_defaults
   tasks:
     - name: Stop multihop-exit and keep it stopped across reboots
       community.docker.docker_container:
@@ -166,4 +181,4 @@
         restart_policy: "no"
       when:
         - stop_old | default(false) | bool
-        - uplink_transport | default('awg') == 'reality'
+        - uplink_transport == 'reality'
