@@ -226,8 +226,32 @@ mark_rules() {
   echo "-m mark --mark $REPLY_MARK -j RETURN"
   echo "-m set --match-set $FORCE_EXIT_SET dst -j $1"
   echo "-m set --match-set $DIRECT_SET dst -j MARK --set-mark $DIRECT_MARK"
+  # Preserve the direct decision for reverse source validation of replies
+  # arriving from the public interface, before Docker reverses its NAT.
+  echo "-m mark --mark $DIRECT_MARK -j CONNMARK --save-mark --nfmask 0xff --ctmask 0xff"
   echo "-m mark --mark $DIRECT_MARK -j RETURN"
   echo "-j $1"
+}
+
+# Incoming published VPN ports need the reply mark before Docker DNAT too.
+# Source validation of a packet forwarded to a bridge performs its reverse
+# lookup with that bridge as iif. In reality mode the unmarked lookup returns
+# RTN_LOCAL from table 51820, which the kernel rejects even with loose
+# rp_filter. src_valid_mark=1 makes the marked reverse lookup use main.
+# Only traffic arriving on the public interface for a local address enters
+# this chain. VPN ports and replies to direct flows receive their own marks;
+# decrypted user traffic never receives this bypass.
+ingress_rules() {
+  local proto
+  echo "-p udp --dport $ENTRY_AWG_PORT -j MARK --set-mark $REPLY_MARK"
+  if [ -n "$ENTRY_XRAY_PORT" ]; then
+    for proto in tcp udp; do
+      echo "-p $proto --dport $ENTRY_XRAY_PORT -j MARK --set-mark $REPLY_MARK"
+    done
+  fi
+  # Only replies to flows explicitly sent direct may restore this byte.
+  # Never restore the VPN reply byte onto decrypted bridge traffic.
+  echo "-m conntrack --ctdir REPLY -m connmark --mark $DIRECT_MARK -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff"
 }
 
 # MULTIHOP-TPROXY: local and bridge destinations go back to normal routing,
@@ -347,6 +371,10 @@ up() {
   ipset create "$FORCE_EXIT_SET" hash:net -exist
   local br jumps=()
   for br in $BRIDGES; do jumps+=("-i $br"); done
+  if [ "$UPLINK_TRANSPORT" = reality ]; then
+    ingress_rules | install_chain mangle PREROUTING MULTIHOP-INGRESS \
+      "-i $PUBLIC_IFACE -m addrtype --dst-type LOCAL"
+  fi
   install_mark "${jumps[@]}"
   install_chain nat POSTROUTING MULTIHOP-NAT <<RULES
 -o $UPLINK_IFACE -j MASQUERADE
@@ -373,6 +401,10 @@ RULES
   ip link set dev "$PUBLIC_IFACE" group "$PUBLIC_GROUP" \
     || echo "${0##*/}: cannot set the group of $PUBLIC_IFACE; bridge traffic to its non-default routes is dropped" >&2
   install_rules
+  if [ "$UPLINK_TRANSPORT" != reality ]; then
+    drop_chain mangle PREROUTING MULTIHOP-INGRESS-NEW
+    drop_chain mangle PREROUTING MULTIHOP-INGRESS
+  fi
 }
 
 # Removes everything. Bridge traffic then follows the main table: stop
@@ -390,6 +422,7 @@ down() {
   local spec
   # MULTIHOP-TPROXY after MULTIHOP-MARK, which references it
   for spec in "mangle PREROUTING MULTIHOP-MARK" "mangle MULTIHOP-MARK $TPROXY_CHAIN" \
+              "mangle PREROUTING MULTIHOP-INGRESS" \
               "nat POSTROUTING MULTIHOP-NAT" \
               "mangle FORWARD MULTIHOP-MSS" "filter DOCKER-USER MULTIHOP-FWD"; do
     # shellcheck disable=SC2086

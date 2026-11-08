@@ -58,6 +58,31 @@
   ansible.builtin.import_tasks: wait-handshake.yml
   when: uplink_transport != 'reality'
 
+# Container-originated curl cannot detect a broken client ingress path. The
+# public-port mark must precede DNAT, and its reverse lookup must use main.
+- name: Verify VPN ingress marking and source validation in reality mode
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      . /etc/multihop/multihop.env
+      iptables -t mangle -C PREROUTING -i "$PUBLIC_IFACE" -m addrtype --dst-type LOCAL -j MULTIHOP-INGRESS
+      iptables -t mangle -C MULTIHOP-INGRESS -p udp --dport "$ENTRY_AWG_PORT" -j MARK --set-mark 0x5b00/0xff00
+      iptables -t mangle -C MULTIHOP-MARK -m mark --mark 0x5a/0xff -j CONNMARK --save-mark --nfmask 0xff --ctmask 0xff
+      iptables -t mangle -C MULTIHOP-INGRESS -m conntrack --ctdir REPLY -m connmark --mark 0x5a/0xff -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff
+      if [ -n "${ENTRY_XRAY_PORT:-}" ]; then
+        for proto in tcp udp; do
+          iptables -t mangle -C MULTIHOP-INGRESS -p "$proto" --dport "$ENTRY_XRAY_PORT" -j MARK --set-mark 0x5b00/0xff00
+        done
+      fi
+      test "$(sysctl -n net.ipv4.conf.all.src_valid_mark)" = 1
+      {% raw %}
+      container_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' amnezia-awg2 | head -n 1)
+      {% endraw %}
+      ip -4 route get "$container_ip" from 1.1.1.1 iif "$PUBLIC_IFACE" mark 0x5b00
+    executable: /bin/bash
+  changed_when: false
+  when: uplink_transport == 'reality'
+
 - name: Inspect the Xray uplink
   ansible.builtin.shell:
     cmd: |

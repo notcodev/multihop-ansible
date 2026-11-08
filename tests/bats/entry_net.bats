@@ -460,6 +460,7 @@ expected_reality_mark() {
 -m mark --mark 0x5b00/0xff00 -j RETURN
 -m set --match-set multihop_force_exit dst -j MULTIHOP-TPROXY
 -m set --match-set multihop_direct dst -j MARK --set-mark 0x5a/0xff
+-m mark --mark 0x5a/0xff -j CONNMARK --save-mark --nfmask 0xff --ctmask 0xff
 -m mark --mark 0x5a/0xff -j RETURN
 -j MULTIHOP-TPROXY
 R
@@ -511,6 +512,7 @@ R
 assert_awg_state() {
   [ "$(cat "$IP_DIR/routes")" = "blackhole default metric 4096 table 51820" ]
   [ ! -e "$IPT_DIR/mangle.MULTIHOP-TPROXY" ]
+  [ ! -e "$IPT_DIR/mangle.MULTIHOP-INGRESS" ]
   ! ls "$IPT_DIR" | grep -e '-NEW' || false
   ! grep -rq -e TPROXY "$IPT_DIR" || false
 }
@@ -525,6 +527,7 @@ R
   diff <(sort "$IPT_DIR/mangle.PREROUTING") - <<'R'
 -i amn0 -j MULTIHOP-MARK
 -i docker0 -j MULTIHOP-MARK
+-i eth9 -m addrtype --dst-type LOCAL -j MULTIHOP-INGRESS
 R
   ! ls "$IPT_DIR" | grep -e '-NEW' || false
   diff <(sort -s -n -k1,1 "$IP_DIR/rules") <(expected_rules)
@@ -558,6 +561,33 @@ R
   diff <(sort "$IPT_DIR/mangle.PREROUTING") - <<'R'
 -i amn0 -j MULTIHOP-MARK
 -i docker0 -j MULTIHOP-MARK
+-i eth9 -m addrtype --dst-type LOCAL -j MULTIHOP-INGRESS
+R
+  no_violations
+}
+
+@test "reality: mark public VPN ingress before local routing for reverse source validation" {
+  reality_env; guard_on
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  diff "$IPT_DIR/mangle.MULTIHOP-INGRESS" - <<'R'
+-p udp --dport 51470 -j MARK --set-mark 0x5b00/0xff00
+-p tcp --dport 443 -j MARK --set-mark 0x5b00/0xff00
+-p udp --dport 443 -j MARK --set-mark 0x5b00/0xff00
+-m conntrack --ctdir REPLY -m connmark --mark 0x5a/0xff -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff
+R
+  ingress=$(first_line '^iptables -t mangle -I PREROUTING -i eth9 -m addrtype --dst-type LOCAL -j MULTIHOP-INGRESS-NEW$')
+  route=$(first_line '^ip route replace local default dev lo table 51820$')
+  [ -n "$ingress" ] && [ "$ingress" -lt "$route" ]
+  no_violations
+
+  # A disabled app Xray must not grant a bypass to that port.
+  env_with UPLINK_TRANSPORT=reality ENTRY_XRAY_PORT= 'ENTRY_LOCAL_NETS="172.17.0.0/16"'
+  run_script multihop-entry-net up
+  [ "$status" -eq 0 ]
+  diff "$IPT_DIR/mangle.MULTIHOP-INGRESS" - <<'R'
+-p udp --dport 51470 -j MARK --set-mark 0x5b00/0xff00
+-m conntrack --ctdir REPLY -m connmark --mark 0x5a/0xff -j CONNMARK --restore-mark --nfmask 0xff --ctmask 0xff
 R
   no_violations
 }
